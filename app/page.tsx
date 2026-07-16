@@ -7,6 +7,7 @@ import {
   GoogleAuthProvider,
   OAuthProvider,
   onAuthStateChanged,
+  signOut,
   signInWithEmailAndPassword,
   signInWithPopup,
 } from "firebase/auth";
@@ -244,6 +245,23 @@ export default function Home() {
     if (result) setRegisterStep(3);
   }
 
+  async function logoutParent() {
+    setBusy(true);
+    try {
+      await signOut(firebaseAuth);
+      setData(null);
+      setActiveChildId("");
+      setParentPassword("");
+      setRegisterStep(1);
+      navigate("welcome");
+      setToast("Signed out successfully");
+    } catch {
+      setToast("Could not sign out. Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function createChildInvite() {
     const result = await runAction("addChild", { name: childName, age: Number(age), avatar: avatars[avatar] });
     if (result) {
@@ -380,7 +398,7 @@ export default function Home() {
 
         {screen === "parent" && (
           <div className="dashboard-view parent-dashboard">
-            <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
+            <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><div className="parent-head-actions"><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button><button className="logout-button" disabled={busy} onClick={logoutParent} aria-label="Sign out">ออกจากระบบ</button></div></div>
             <div className="parent-team"><div><span className="muted">Parents</span><div className="parent-chips">{(data?.members ?? []).map((member: any) => <span className="parent-chip" key={member.id}><i>{String(member.display_name ?? "P").slice(0,1).toUpperCase()}</i><b>{member.display_name}</b><small>{member.role === "owner" ? "Owner" : "Parent"}</small></span>)}</div></div><button onClick={createParentInvite} aria-label="Invite another parent">+</button></div>
             {parentInviteCode && <div className="parent-invite-banner"><span>Parent invite</span><b>{parentInviteCode}</b><button onClick={() => navigator.clipboard?.writeText(parentInviteCode)}>Copy</button></div>}
             <div className="family-strip"><div className="family-selector">{parentChildren.map((child: any) => <button className={`member ${activeChild?.id === child.id ? "active" : ""}`} onClick={() => setActiveChildId(String(child.id))} key={child.id}><span>{child.avatar}</span><small>{child.nickname ?? child.name}</small></button>)}<button className="member add" onClick={() => { setInviteReady(false); navigate("add-child"); }}><span>+</span><small>Add</small></button></div></div>
