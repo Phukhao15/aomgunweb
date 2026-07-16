@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import QRCode from "qrcode";
 
 type Screen =
   | "welcome"
@@ -22,11 +23,27 @@ const qrPattern = [
   1,0,1,0,1,0,1,1,1,1,0,1,1,
 ];
 
-const transactions = [
-  { icon: "🥤", title: "Bubble tea", meta: "Food & drink · Today", amount: "−฿85", negative: true },
-  { icon: "🎮", title: "Game top-up", meta: "Fun · Yesterday", amount: "−฿120", negative: true },
-  { icon: "💸", title: "Weekly allowance", meta: "From Mom · 2 days ago", amount: "+฿500", negative: false },
-];
+function money(value: number | string) {
+  const amount = Number(value ?? 0) / 100;
+  return new Intl.NumberFormat("th-TH", { style: "currency", currency: "THB", maximumFractionDigits: 0 }).format(amount);
+}
+
+function transactionView(item: any) {
+  const negative = Number(item.amount) < 0;
+  const date = item.created_at ? new Date(String(item.created_at).replace(" ", "T") + "Z") : new Date();
+  return {
+    icon: item.kind === "allowance" ? "💸" : item.category === "Food & drink" ? "🥤" : "🧾",
+    title: item.note || (item.kind === "allowance" ? "Allowance" : "Expense"),
+    meta: `${item.category} · ${date.toLocaleDateString("en", { month: "short", day: "numeric" })}`,
+    amount: `${negative ? "−" : "+"}${money(Math.abs(Number(item.amount)))}`,
+    negative,
+  };
+}
+
+function goalPercent(goal: any) {
+  if (!goal || !Number(goal.target_amount)) return 0;
+  return Math.min(100, Math.round(Number(goal.saved_amount) / Number(goal.target_amount) * 100));
+}
 
 function Icon({ name }: { name: "arrow" | "bell" | "eye" | "plus" | "scan" | "copy" | "shield" }) {
   const symbols = { arrow: "←", bell: "♧", eye: "◉", plus: "+", scan: "⌗", copy: "▣", shield: "◆" };
@@ -59,6 +76,38 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [parentTab, setParentTab] = useState("Home");
   const [childTab, setChildTab] = useState("Home");
+  const [parentName, setParentName] = useState("Nina");
+  const [familyName, setFamilyName] = useState("The Santisuk Family");
+  const [inviteCode, setInviteCode] = useState("");
+  const [data, setData] = useState<any>(null);
+  const [activeChildId, setActiveChildId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [qrImage, setQrImage] = useState("");
+  const [parentInviteCode, setParentInviteCode] = useState("");
+
+  const parentChildren = data?.role === "parent" && data.registered ? data.children ?? [] : [];
+  const activeChild = parentChildren.find((child: any) => child.id === activeChildId) ?? parentChildren[0] ?? null;
+  const childRecord = data?.role === "child" ? data.child : null;
+  const liveTransactions = data?.transactions ?? [];
+
+  useEffect(() => {
+    void loadSession();
+    const invite = new URLSearchParams(window.location.search).get("invite");
+    if (invite) {
+      setCode(invite.toUpperCase());
+      setScreen("join");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!inviteCode) return;
+    const joinUrl = `${window.location.origin}/?invite=${encodeURIComponent(inviteCode)}`;
+    QRCode.toDataURL(joinUrl, { width: 220, margin: 1, color: { dark: "#172039", light: "#ffffff" } }).then(setQrImage).catch(() => setQrImage(""));
+  }, [inviteCode]);
+
+  useEffect(() => {
+    if (!activeChildId && parentChildren[0]?.id) setActiveChildId(String(parentChildren[0].id));
+  }, [activeChildId, parentChildren]);
 
   const screenTitle = useMemo(() => ({
     welcome: "Choose your path", register: "Create your account", parent: "Family dashboard",
@@ -71,8 +120,119 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  async function loadSession() {
+    try {
+      const response = await fetch("/api/app", { cache: "no-store" });
+      const result = await response.json();
+      setData(result);
+      if (result.role === "child") {
+        setNickname(result.child?.nickname ?? result.child?.name ?? "Milo");
+      }
+    } catch {
+      setToast("Could not connect to the local database");
+    }
+  }
+
+  async function runAction(action: string, payload: Record<string, unknown> = {}) {
+    setBusy(true);
+    try {
+      const response = await fetch("/api/app", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, ...payload }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "Request failed");
+      if (result.role || result.child) setData(result);
+      return result;
+    } catch (cause) {
+      setToast(cause instanceof Error ? cause.message : "Something went wrong");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openParent() {
+    if (data?.role === "child") {
+      await runAction("logoutChild");
+      await loadSession();
+    }
+    const response = await fetch("/api/app", { cache: "no-store" });
+    const result = await response.json();
+    setData(result);
+    if (result.role === "anonymous" && result.signInPath) {
+      window.location.href = result.signInPath;
+      return;
+    }
+    navigate(result.registered ? "parent" : "register");
+  }
+
+  async function registerParent() {
+    const result = await runAction("registerParent", { name: parentName, familyName });
+    if (result) setRegisterStep(3);
+  }
+
+  async function createChildInvite() {
+    const result = await runAction("addChild", { name: childName, age: Number(age), avatar: avatars[avatar] });
+    if (result) {
+      setInviteCode(result.code);
+      setInviteReady(true);
+      await loadSession();
+    }
+  }
+
+  async function createParentInvite() {
+    const result = await runAction("createParentInvite");
+    if (result) {
+      setParentInviteCode(result.code);
+      await navigator.clipboard?.writeText(result.code);
+      setToast("Parent invite copied · valid for 72 hours");
+    }
+  }
+
+  async function joinAsParent() {
+    const invite = window.prompt("Enter the parent invite code");
+    if (!invite) return;
+    const result = await runAction("joinAsParent", { code: invite.toUpperCase() });
+    if (result) navigate("parent");
+  }
+
+  async function joinFamily() {
+    const result = await runAction("joinChild", { code, nickname, pin });
+    if (result) navigate("child");
+  }
+
+  async function sendAllowance() {
+    if (!activeChild) return setToast("Add a child first");
+    const value = window.prompt(`Allowance for ${activeChild.name} (THB)`, "500");
+    if (!value) return;
+    const result = await runAction("sendAllowance", { childId: activeChild.id, amount: Number(value), note: "Weekly allowance" });
+    if (result) setToast("Allowance sent and saved");
+  }
+
+  async function setBudgets() {
+    if (!activeChild) return setToast("Add a child first");
+    const daily = window.prompt("Daily budget (THB)", String(Number(activeChild.daily_budget) / 100));
+    if (!daily) return;
+    const weekly = window.prompt("Weekly budget (THB)", String(Number(activeChild.weekly_budget) / 100));
+    if (!weekly) return;
+    const monthly = window.prompt("Monthly budget (THB)", String(Number(activeChild.monthly_budget) / 100));
+    if (!monthly) return;
+    const result = await runAction("setBudgets", { childId: activeChild.id, daily: Number(daily), weekly: Number(weekly), monthly: Number(monthly) });
+    if (result) setToast("Budgets updated securely");
+  }
+
+  async function addExpense() {
+    const amount = window.prompt("Expense amount (THB)", "85");
+    if (!amount) return;
+    const note = window.prompt("What did you buy?", "Bubble tea") ?? "Expense";
+    const result = await runAction("recordExpense", { amount: Number(amount), category: "Food & drink", note });
+    if (result) setToast("Expense saved");
+  }
+
   function copyCode() {
-    navigator.clipboard?.writeText("MILO-4821");
+    navigator.clipboard?.writeText(inviteCode);
     setToast("Invite code copied");
     window.setTimeout(() => setToast(""), 1800);
   }
@@ -104,7 +264,7 @@ export default function Home() {
               <p>A safe, joyful space for families to learn, save and spend with confidence.</p>
             </div>
             <div className="role-actions">
-              <button className="role-card parent-role" onClick={() => navigate("register")}>
+              <button className="role-card parent-role" onClick={openParent}>
                 <span className="role-icon">👩🏻‍💼</span><span><b>I’m a Parent</b><small>Create & manage a family</small></span><strong>→</strong>
               </button>
               <button className="role-card child-role" onClick={() => navigate("join")}>
@@ -121,23 +281,24 @@ export default function Home() {
             {registerStep === 1 && <>
               <div className="page-heading"><span className="kicker">FOR PARENTS</span><h2>Let’s create your<br />family space</h2><p>Start in seconds. Your family is created automatically.</p></div>
               <div className="auth-stack">
-                <button className="social-button"><span className="google">G</span>Continue with Google</button>
-                <button className="social-button apple"><span>●</span>Continue with Apple</button>
+                <button className="social-button" onClick={() => setToast("Add your Google Client ID to enable this provider")}><span className="google">G</span>Continue with Google</button>
+                <button className="social-button apple" onClick={() => setToast("Add your Apple Client ID to enable this provider")}><span>●</span>Continue with Apple</button>
                 <div className="divider"><span>or use email</span></div>
                 <label>Email address<input type="email" defaultValue="parent@example.com" aria-label="Email address" /></label>
                 <button className="primary" onClick={() => setRegisterStep(2)}>Continue</button>
+                <button className="secondary-link" onClick={joinAsParent}>I have a parent invite code</button>
               </div>
             </>}
             {registerStep === 2 && <>
               <div className="page-heading"><span className="kicker">YOUR DETAILS</span><h2>What should we<br />call you?</h2><p>This is how your children will see you in the app.</p></div>
               <div className="profile-setup"><div className="big-avatar">👩🏻</div><button className="avatar-edit">+</button></div>
-              <div className="form-grid"><label>Your name<input defaultValue="Nina" /></label><label>Family name<input defaultValue="The Santisuk Family" /></label></div>
-              <button className="primary bottom-primary" onClick={() => setRegisterStep(3)}>Create my family</button>
+              <div className="form-grid"><label>Your name<input value={parentName} onChange={(event) => setParentName(event.target.value)} /></label><label>Family name<input value={familyName} onChange={(event) => setFamilyName(event.target.value)} /></label></div>
+              <button className="primary bottom-primary" disabled={busy} onClick={registerParent}>{busy ? "Creating…" : "Create my family"}</button>
             </>}
             {registerStep === 3 && <div className="success-view">
               <div className="success-burst"><div className="success-house">⌂<span>♥</span></div></div>
-              <span className="kicker">ALL SET</span><h2>Your family is ready!</h2><p>You’re now the owner of <b>The Santisuk Family</b>. Let’s add your first child.</p>
-              <div className="owner-pill"><span>👩🏻</span><div><b>Nina</b><small>Family owner</small></div><i>✓</i></div>
+              <span className="kicker">ALL SET</span><h2>Your family is ready!</h2><p>You’re now the owner of <b>{familyName}</b>. Let’s add your first child.</p>
+              <div className="owner-pill"><span>👩🏻</span><div><b>{parentName}</b><small>Family owner</small></div><i>✓</i></div>
               <button className="primary" onClick={() => navigate("add-child")}>Add my first child</button>
               <button className="secondary-link" onClick={() => navigate("parent")}>I’ll do this later</button>
             </div>}
@@ -146,16 +307,18 @@ export default function Home() {
 
         {screen === "parent" && (
           <div className="dashboard-view parent-dashboard">
-            <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>Nina <span>👋</span></h2></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
-            <div className="family-strip"><div className="family-selector"><button className="member active"><span>🧒🏻</span><small>Milo</small></button><button className="member"><span>👧🏽</span><small>Lena</small></button><button className="member add" onClick={() => navigate("add-child")}><span>+</span><small>Add</small></button></div></div>
+            <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
+            <div className="parent-team"><div><span className="muted">Parents</span><div className="parent-chips">{(data?.members ?? []).map((member: any) => <span className="parent-chip" key={member.id}><i>{String(member.display_name ?? "P").slice(0,1).toUpperCase()}</i><b>{member.display_name}</b><small>{member.role === "owner" ? "Owner" : "Parent"}</small></span>)}</div></div><button onClick={createParentInvite} aria-label="Invite another parent">+</button></div>
+            {parentInviteCode && <div className="parent-invite-banner"><span>Parent invite</span><b>{parentInviteCode}</b><button onClick={() => navigator.clipboard?.writeText(parentInviteCode)}>Copy</button></div>}
+            <div className="family-strip"><div className="family-selector">{parentChildren.map((child: any) => <button className={`member ${activeChild?.id === child.id ? "active" : ""}`} onClick={() => setActiveChildId(String(child.id))} key={child.id}><span>{child.avatar}</span><small>{child.nickname ?? child.name}</small></button>)}<button className="member add" onClick={() => { setInviteReady(false); navigate("add-child"); }}><span>+</span><small>Add</small></button></div></div>
             <div className="overview-card">
               <div className="overview-title"><span>This month</span><button aria-label="Toggle balance"><Icon name="eye" /></button></div>
-              <h3>฿3,550</h3><p>Total allowance sent</p>
-              <div className="stats-row"><div><i className="green">↓</i><span><small>Saved</small><b>฿1,050</b></span></div><div><i className="red">↑</i><span><small>Spent</small><b>฿2,450</b></span></div></div>
+              <h3>{money(activeChild?.received ?? 0)}</h3><p>Total allowance sent</p>
+              <div className="stats-row"><div><i className="green">↓</i><span><small>Balance</small><b>{money(activeChild?.balance ?? 0)}</b></span></div><div><i className="red">↑</i><span><small>Spent</small><b>{money(activeChild?.spent ?? 0)}</b></span></div></div>
             </div>
-            <div className="quick-actions"><button><i className="qa-purple">↗</i><span>Send<br />allowance</span></button><button onClick={() => { setParentTab("Budgets"); setToast("Budget controls opened"); }}><i className="qa-blue">▥</i><span>Set<br />budget</span></button><button><i className="qa-green">◎</i><span>View<br />savings</span></button></div>
+            <div className="quick-actions"><button onClick={sendAllowance}><i className="qa-purple">↗</i><span>Send<br />allowance</span></button><button onClick={setBudgets}><i className="qa-blue">▥</i><span>Set<br />budget</span></button><button><i className="qa-green">◎</i><span>View<br />savings</span></button></div>
             <section className="spending-card"><div className="section-title"><div><h3>Spending</h3><span>June overview</span></div><button>Details</button></div><div className="chart-row"><div className="donut"><span>฿2.4k<small>spent</small></span></div><ul><li><i className="blue-dot" />Food <b>45%</b></li><li><i className="purple-dot" />Fun <b>30%</b></li><li><i className="yellow-dot" />Travel <b>25%</b></li></ul></div></section>
-            <section className="recent"><div className="section-title"><h3>Recent activity</h3><button>See all</button></div>{transactions.slice(0,2).map((t) => <Transaction key={t.title} {...t} />)}</section>
+            <section className="recent"><div className="section-title"><h3>Recent activity</h3><button>See all</button></div>{liveTransactions.filter((item: any) => !activeChild || item.child_id === activeChild.id).slice(0,3).map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">No activity yet</p>}</section>
             <BottomNav active={parentTab} onSelect={setParentTab} parent />
           </div>
         )}
@@ -168,11 +331,11 @@ export default function Home() {
               <div className="avatar-picker"><div className="selected-avatar">{avatars[avatar]}</div><span>Choose an avatar</span><div className="avatar-options">{avatars.map((a, i) => <button key={a} className={avatar === i ? "selected" : ""} onClick={() => setAvatar(i)}>{a}</button>)}</div></div>
               <div className="form-grid"><label>Child’s name<input value={childName} onChange={(e) => setChildName(e.target.value)} /></label><label>Age<select value={age} onChange={(e) => setAge(e.target.value)}>{Array.from({length:14},(_,i) => i+4).map(a => <option key={a}>{a}</option>)}</select></label></div>
               <div className="info-banner"><span>✦</span><p>No email needed. {childName || "Your child"} will create a nickname and 4-digit PIN when joining.</p></div>
-              <button className="primary bottom-primary" onClick={() => setInviteReady(true)}>Create child invite</button>
+              <button className="primary bottom-primary" disabled={busy} onClick={createChildInvite}>{busy ? "Creating…" : "Create child invite"}</button>
             </> : <div className="invite-view">
               <div className="invite-avatar">{avatars[avatar]}<i>✓</i></div><span className="kicker">INVITE READY</span><h2>Invite {childName}</h2><p>Have them enter this code or scan the QR on their device.</p>
-              <div className="qr-card"><div className="qr-grid">{qrPattern.map((on, i) => <i className={on ? "on" : ""} key={i} />)}</div><span>THE SANTISUK FAMILY</span></div>
-              <div className="code-box"><small>INVITE CODE</small><b>MILO-4821</b><button onClick={copyCode} aria-label="Copy invite code"><Icon name="copy" /></button></div>
+              <div className="qr-card">{qrImage ? <img className="qr-image" src={qrImage} alt={`Invite QR code for ${childName}`} /> : <div className="qr-grid">{qrPattern.map((on, i) => <i className={on ? "on" : ""} key={i} />)}</div>}<span>{String(data?.family?.name ?? familyName).toUpperCase()}</span></div>
+              <div className="code-box"><small>INVITE CODE</small><b>{inviteCode}</b><button onClick={copyCode} aria-label="Copy invite code"><Icon name="copy" /></button></div>
               <div className="expiry">◷ Expires in 24 hours</div>
               <button className="primary" onClick={() => navigate("parent")}>Done</button>
               <button className="secondary-link" onClick={() => setToast("Share sheet opened")}>Share invite</button>
@@ -188,7 +351,7 @@ export default function Home() {
             <label className="code-input-label">Family invite code<input value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} placeholder="MILO-4821" maxLength={9} /></label>
             <button className="primary child-primary" disabled={code.length < 4} onClick={() => navigate("pin")}>Join family</button>
             <div className="or"><span>or</span></div>
-            <button className="scan-button" onClick={() => { setCode("MILO-4821"); setToast("QR code scanned"); }}><Icon name="scan" /> Scan QR code</button>
+            <button className="scan-button" onClick={() => setToast("Camera scanning is available after HTTPS deployment")}><Icon name="scan" /> Scan QR code</button>
             <p className="child-safe">◆ You’ll only see your own money — never anyone else’s.</p>
           </div>
         )}
@@ -201,21 +364,21 @@ export default function Home() {
             <label className="nickname-label">Nickname<input value={nickname} onChange={(e) => setNickname(e.target.value)} maxLength={14} /></label>
             <div className="pin-dots" aria-label={`${pin.length} of 4 PIN digits entered`}>{[0,1,2,3].map(i => <i className={pin.length > i ? "filled" : ""} key={i} />)}</div>
             <div className="pin-pad">{["1","2","3","4","5","6","7","8","9","","0","⌫"].map((n,i) => n ? <button key={i} onClick={() => pinPress(n)}>{n}</button> : <span key={i} />)}</div>
-            <button className="primary child-primary" disabled={pin.length < 4 || !nickname} onClick={() => navigate("child")}>Start exploring</button>
+            <button className="primary child-primary" disabled={busy || pin.length < 4 || !nickname} onClick={joinFamily}>{busy ? "Joining…" : "Start exploring"}</button>
           </div>
         )}
 
         {screen === "child" && (
           <div className="dashboard-view child-dashboard">
             <div className="child-hero">
-              <div className="dashboard-head"><div className="hello"><span className="child-avatar">{avatars[avatar]}</span><span><small>Hi, {nickname}!</small><b>Ready to grow? 🌱</b></span></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
-              <div className="balance-card"><div><span>My balance <button aria-label="Toggle balance"><Icon name="eye" /></button></span><h2>฿1,050</h2><small>+฿500 this week</small></div><div className="piggy">🐷<i>฿</i></div></div>
+              <div className="dashboard-head"><div className="hello"><span className="child-avatar">{childRecord?.avatar ?? avatars[avatar]}</span><span><small>Hi, {childRecord?.nickname ?? nickname}!</small><b>Ready to grow? 🌱</b></span></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
+              <div className="balance-card"><div><span>My balance <button aria-label="Toggle balance"><Icon name="eye" /></button></span><h2>{money(childRecord?.balance ?? 0)}</h2><small>Stored securely for this profile</small></div><div className="piggy">🐷<i>฿</i></div></div>
             </div>
             <div className="child-content">
-              <div className="budget-cards"><div className="budget-card"><div><span>Today’s spending</span><b>฿50 <small>/ ฿200</small></b></div><strong>25%</strong><div className="progress"><i style={{width:"25%"}} /></div></div><div className="budget-card goal-card"><div><span>Saving goal</span><b>New bicycle 🚲</b></div><strong>42%</strong><div className="progress"><i style={{width:"42%"}} /></div></div></div>
-              <div className="quick-actions child-actions"><button><i>＋</i><span>Add expense</span></button><button><i>◎</i><span>My savings</span></button><button><i>☷</i><span>All activity</span></button></div>
+              <div className="budget-cards"><div className="budget-card"><div><span>Today’s budget</span><b>{money(childRecord?.daily_budget ?? 0)}</b></div><strong>Live</strong><div className="progress"><i style={{width:"25%"}} /></div></div><div className="budget-card goal-card"><div><span>Saving goal</span><b>{data?.goals?.[0]?.name ?? "New bicycle"} 🚲</b></div><strong>{goalPercent(data?.goals?.[0])}%</strong><div className="progress"><i style={{width:`${goalPercent(data?.goals?.[0])}%`}} /></div></div></div>
+              <div className="quick-actions child-actions"><button onClick={addExpense}><i>＋</i><span>Add expense</span></button><button><i>◎</i><span>My savings</span></button><button><i>☷</i><span>All activity</span></button></div>
               <section className="streak"><div className="streak-star">★</div><div><small>YOUR MONEY STREAK</small><h3>5 days of tracking!</h3><p>Two more days to unlock a badge.</p></div><span>🔥</span></section>
-              <section className="recent"><div className="section-title"><h3>My activity</h3><button>See all</button></div>{transactions.map((t) => <Transaction key={t.title} {...t} />)}</section>
+              <section className="recent"><div className="section-title"><h3>My activity</h3><button>See all</button></div>{liveTransactions.map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">Your activity will appear here</p>}</section>
             </div>
             <BottomNav active={childTab} onSelect={setChildTab} />
           </div>
