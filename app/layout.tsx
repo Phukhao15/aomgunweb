@@ -14,11 +14,11 @@ const geistMono = Geist_Mono({
 
 export function generateMetadata(): Metadata {
   return {
-    title: "AomGun — ออมเงินไปด้วยกันทั้งครอบครัว",
+    title: "AomGun Family — ออมเงินไปด้วยกันทั้งครอบครัว",
     description: "A premium family finance experience for parents and children to budget, save and learn together.",
     icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
     openGraph: {
-      title: "AomGun — Family Money, Growing Together",
+      title: "AomGun Family — Family Money, Growing Together",
       description: "Budget, save and learn together in one safe family space.",
     },
     twitter: { card: "summary" },

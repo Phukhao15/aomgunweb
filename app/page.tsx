@@ -61,9 +61,9 @@ function Icon({ name }: { name: "arrow" | "bell" | "eye" | "plus" | "scan" | "co
 
 function Brand() {
   return (
-    <div className="brand" aria-label="AomGun">
+    <div className="brand" aria-label="AomGun Family">
       <span className="brand-mark"><span>●</span><span>●</span></span>
-      <span>AomGun</span>
+      <span>AomGun Family</span>
     </div>
   );
 }
@@ -150,7 +150,7 @@ export default function Home() {
       }
       return result;
     } catch {
-      setToast("Could not connect to AomGun");
+      setToast("Could not connect to AomGun Family");
       return null;
     }
   }

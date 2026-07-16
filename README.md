@@ -1,6 +1,6 @@
-# AomGun
+# AomGun Family
 
-AomGun is a family finance web application for parents and children. Parents can create a family, invite additional parents, add children, set budgets, send allowance, and review activity. Children join without an email by using a one-time code and four-digit PIN.
+AomGun Family is a family finance web application for parents and children. Parents can create a family, invite additional parents, add children, set budgets, send allowance, and review activity. Children join without an email by using a one-time code and four-digit PIN.
 
 ## Stack
 
