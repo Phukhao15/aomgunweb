@@ -1,6 +1,6 @@
 import "server-only";
 
-import { cert, getApp, getApps, initializeApp, type ServiceAccount } from "firebase-admin/app";
+import { cert, getApp, getApps, initializeApp, type App, type ServiceAccount } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 import { existsSync, readFileSync } from "node:fs";
@@ -26,7 +26,18 @@ function credentials(): ServiceAccount {
   throw new Error("Firebase Admin credentials are not configured");
 }
 
-const adminApp = getApps().length ? getApp() : initializeApp({ credential: cert(credentials()) });
+let cachedApp: App | undefined;
 
-export const adminAuth = getAuth(adminApp);
-export const firestore = getFirestore(adminApp);
+function adminApp() {
+  if (cachedApp) return cachedApp;
+  cachedApp = getApps().length ? getApp() : initializeApp({ credential: cert(credentials()) });
+  return cachedApp;
+}
+
+export function getAdminAuth() {
+  return getAuth(adminApp());
+}
+
+export function getFirestoreDb() {
+  return getFirestore(adminApp());
+}

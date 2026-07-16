@@ -1,4 +1,4 @@
-import { adminAuth, firestore } from "../../../lib/firebase-admin";
+import { getAdminAuth, getFirestoreDb } from "../../../lib/firebase-admin";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -6,17 +6,26 @@ export const dynamic = "force-dynamic";
 type Row = Record<string, unknown>;
 type ParentIdentity = { uid: string; email: string; displayName: string };
 
-const collections = {
-  users: firestore.collection("users"),
-  families: firestore.collection("families"),
-  members: firestore.collection("familyMembers"),
-  parentInvites: firestore.collection("parentInvites"),
-  children: firestore.collection("children"),
-  invites: firestore.collection("childInvites"),
-  childSessions: firestore.collection("childSessions"),
-  transactions: firestore.collection("transactions"),
-  goals: firestore.collection("savingsGoals"),
-};
+const collectionNames = {
+  users: "users",
+  families: "families",
+  members: "familyMembers",
+  parentInvites: "parentInvites",
+  children: "children",
+  invites: "childInvites",
+  childSessions: "childSessions",
+  transactions: "transactions",
+  goals: "savingsGoals",
+} as const;
+
+type CollectionName = keyof typeof collectionNames;
+
+const collections = new Proxy({} as Record<CollectionName, FirebaseFirestore.CollectionReference>, {
+  get(_target, property) {
+    if (typeof property !== "string" || !(property in collectionNames)) return undefined;
+    return getFirestoreDb().collection(collectionNames[property as CollectionName]);
+  },
+});
 
 function now() {
   return new Date().toISOString();
@@ -83,7 +92,7 @@ async function parentIdentity(request: Request): Promise<ParentIdentity | null> 
   const authorization = request.headers.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return null;
   try {
-    const decoded = await adminAuth.verifyIdToken(authorization.slice(7));
+    const decoded = await getAdminAuth().verifyIdToken(authorization.slice(7));
     if (!decoded.email) return null;
     return {
       uid: decoded.uid,
@@ -196,7 +205,7 @@ export async function POST(request: Request) {
       if (!await parentFamily(identity)) {
         const familyId = id("fam");
         const createdAt = now();
-        const batch = firestore.batch();
+        const batch = getFirestoreDb().batch();
         batch.set(collections.users.doc(identity.uid), { email: identity.email, display_name: name, created_at: createdAt });
         batch.set(collections.families.doc(familyId), { owner_user_id: identity.uid, name: familyName, created_at: createdAt });
         batch.set(collections.members.doc(`${familyId}_${identity.uid}`), { family_id: familyId, user_id: identity.uid, role: "owner", created_at: createdAt });
@@ -220,7 +229,7 @@ export async function POST(request: Request) {
       const code = randomCode();
       const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
       const createdAt = now();
-      const batch = firestore.batch();
+      const batch = getFirestoreDb().batch();
       batch.set(collections.children.doc(childId), { family_id: family.id, name, age, avatar, nickname: null, pin_salt: null, pin_hash: null, daily_budget: 20000, weekly_budget: 100000, monthly_budget: 350000, created_at: createdAt });
       batch.set(collections.invites.doc(inviteId), { family_id: family.id, child_id: childId, code_hash: await sha256(code), expires_at: expiresAt, used_at: null, created_at: createdAt });
       batch.set(collections.goals.doc(goalId), { child_id: childId, name: "New bicycle", target_amount: 1200000, saved_amount: 0, created_at: createdAt });
@@ -248,7 +257,7 @@ export async function POST(request: Request) {
       const inviteQuery = await collections.parentInvites.where("code_hash", "==", await sha256(code)).limit(1).get();
       if (inviteQuery.empty) return error("Parent invite was not found", 404);
       const inviteRef = inviteQuery.docs[0].ref;
-      await firestore.runTransaction(async (transaction) => {
+      await getFirestoreDb().runTransaction(async (transaction) => {
         const invite = await transaction.get(inviteRef);
         const data = invite.data()!;
         if (data.used_at) throw new Error("USED_PARENT_INVITE");
@@ -276,7 +285,7 @@ export async function POST(request: Request) {
       const sessionExpiry = new Date(Date.now() + 30 * 86_400_000).toISOString();
       const pinData = await hashPin(pin);
       let childId = "";
-      await firestore.runTransaction(async (transaction) => {
+      await getFirestoreDb().runTransaction(async (transaction) => {
         const invite = await transaction.get(inviteRef);
         const data = invite.data()!;
         if (data.used_at) throw new Error("USED_CHILD_INVITE");
