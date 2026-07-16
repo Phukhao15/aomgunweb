@@ -61,6 +61,14 @@ async function hashPin(pin: string, salt = randomToken().slice(0, 22)) {
   return { salt, hash: base64Url(new Uint8Array(bits)) };
 }
 
+async function verifyPin(pin: string, salt: string, expected: string) {
+  const actual = (await hashPin(pin, salt)).hash;
+  if (actual.length !== expected.length) return false;
+  let difference = 0;
+  for (let index = 0; index < actual.length; index++) difference |= actual.charCodeAt(index) ^ expected.charCodeAt(index);
+  return difference === 0;
+}
+
 function row(idValue: string, data: FirebaseFirestore.DocumentData): Row {
   return { id: idValue, ...data };
 }
@@ -164,6 +172,7 @@ async function parentSnapshot(identity: ParentIdentity) {
   }));
   members.sort((a, b) => a.role === "owner" ? -1 : b.role === "owner" ? 1 : String(a.created_at).localeCompare(String(b.created_at)));
   const transactionGroups = await Promise.all(childRows.map((child) => recordsBy(collections.transactions, "child_id", String(child.id))));
+  const goalGroups = await Promise.all(childRows.map((child) => recordsBy(collections.goals, "child_id", String(child.id))));
   const children: Row[] = childRows.map((child, index) => {
     const transactions = transactionGroups[index];
     const balance = transactions.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
@@ -176,7 +185,11 @@ async function parentSnapshot(identity: ParentIdentity) {
     ...item,
     child_name: children.find((child) => child.id === item.child_id)?.name ?? "Child",
   }));
-  return { role: "parent", registered: true, identity, family, members, children, transactions };
+  const goals = newestFirst(goalGroups.flat()).map((goal) => ({
+    ...goal,
+    child_name: children.find((child) => child.id === goal.child_id)?.name ?? "Child",
+  }));
+  return { role: "parent", registered: true, identity, family, members, children, transactions, goals };
 }
 
 export async function GET(request: Request) {
@@ -252,6 +265,21 @@ export async function POST(request: Request) {
       return Response.json({ code, expiresAt, familyName: family.name }, { status: 201 });
     }
 
+    if (action === "updateParentProfile") {
+      const identity = await parentIdentity(request);
+      if (!identity) return error("Parent sign-in is required", 401);
+      const family = await parentFamily(identity);
+      if (!family) return error("Family was not found", 404);
+      const displayName = String(payload.name ?? "").trim().slice(0, 60);
+      const familyName = String(payload.familyName ?? "").trim().slice(0, 80);
+      if (!displayName || !familyName) return error("Name and family name are required");
+      const batch = getFirestoreDb().batch();
+      batch.set(collections.users.doc(identity.uid), { display_name: displayName, email: identity.email }, { merge: true });
+      batch.update(collections.families.doc(String(family.id)), { name: familyName });
+      await batch.commit();
+      return Response.json(await parentSnapshot({ ...identity, displayName }));
+    }
+
     if (action === "joinAsParent") {
       const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
@@ -292,9 +320,17 @@ export async function POST(request: Request) {
       await getFirestoreDb().runTransaction(async (transaction) => {
         const invite = await transaction.get(inviteRef);
         const data = invite.data()!;
-        if (data.used_at) throw new Error("USED_CHILD_INVITE");
-        if (new Date(String(data.expires_at)).getTime() <= Date.now()) throw new Error("EXPIRED_CHILD_INVITE");
         childId = String(data.child_id);
+        if (data.used_at) {
+          const existingChild = await transaction.get(collections.children.doc(childId));
+          const existingData = existingChild.data();
+          if (!existingData?.pin_salt || !existingData?.pin_hash || !await verifyPin(pin, existingData.pin_salt, existingData.pin_hash)) {
+            throw new Error("INVALID_CHILD_PIN");
+          }
+          transaction.set(collections.childSessions.doc(tokenHash), { child_id: childId, expires_at: sessionExpiry, created_at: now() });
+          return;
+        }
+        if (new Date(String(data.expires_at)).getTime() <= Date.now()) throw new Error("EXPIRED_CHILD_INVITE");
         transaction.update(collections.children.doc(childId), { nickname, pin_salt: pinData.salt, pin_hash: pinData.hash });
         transaction.update(inviteRef, { used_at: now() });
         transaction.set(collections.childSessions.doc(tokenHash), { child_id: childId, expires_at: sessionExpiry, created_at: now() });
@@ -320,6 +356,43 @@ export async function POST(request: Request) {
       if (amount > balance) return error("This expense is higher than your available balance", 409);
       await collections.transactions.doc(id("txn")).set({ child_id: child.id, actor_type: "child", kind: "expense", amount: -amount, category, note, created_at: now() });
       return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) }, { status: 201 });
+    }
+
+    if (action === "changeChildPin") {
+      const child = await childFromSession(request);
+      if (!child) return error("Child session is required", 401);
+      const pin = String(payload.pin ?? "");
+      if (!/^\d{4}$/.test(pin)) return error("PIN must contain exactly four digits");
+      const pinData = await hashPin(pin);
+      await collections.children.doc(String(child.id)).update({ pin_salt: pinData.salt, pin_hash: pinData.hash });
+      return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) });
+    }
+
+    if (action === "createSavingsGoal") {
+      const child = await childFromSession(request);
+      if (!child) return error("Child session is required", 401);
+      const name = String(payload.name ?? "").trim().slice(0, 60);
+      const targetAmount = Math.round(Number(payload.targetAmount) * 100);
+      if (!name || !Number.isFinite(targetAmount) || targetAmount <= 0 || targetAmount > 100_000_000) return error("Enter a valid goal and target");
+      await collections.goals.doc(id("goal")).set({ child_id: child.id, name, target_amount: targetAmount, saved_amount: 0, created_at: now() });
+      return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) }, { status: 201 });
+    }
+
+    if (action === "saveTowardGoal") {
+      const child = await childFromSession(request);
+      if (!child) return error("Child session is required", 401);
+      const goalId = String(payload.goalId ?? "");
+      const amount = Math.round(Number(payload.amount) * 100);
+      const goal = await collections.goals.doc(goalId).get();
+      if (!goal.exists || goal.data()!.child_id !== child.id) return error("Savings goal was not found", 404);
+      const transactions = await recordsBy(collections.transactions, "child_id", String(child.id));
+      const balance = transactions.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > balance) return error("Enter an amount within your available balance");
+      const batch = getFirestoreDb().batch();
+      batch.update(goal.ref, { saved_amount: Number(goal.data()!.saved_amount ?? 0) + amount });
+      batch.set(collections.transactions.doc(id("txn")), { child_id: child.id, actor_type: "child", kind: "saving", amount: -amount, category: "Savings", note: String(goal.data()!.name), created_at: now() });
+      await batch.commit();
+      return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) });
     }
 
     if (action === "sendAllowance" || action === "setBudgets") {
@@ -351,6 +424,7 @@ export async function POST(request: Request) {
     const message = cause instanceof Error ? cause.message : "";
     if (message === "PARENT_AUTH_FAILED") return error("Parent sign-in could not be verified. Check the Firebase Admin environment variable and redeploy.", 503);
     if (message === "USED_PARENT_INVITE" || message === "USED_CHILD_INVITE") return error("This invite has already been used", 409);
+    if (message === "INVALID_CHILD_PIN") return error("That PIN is not correct", 401);
     if (message === "EXPIRED_PARENT_INVITE" || message === "EXPIRED_CHILD_INVITE") return error("This invite has expired", 410);
     return error("The request could not be completed", 500);
   }

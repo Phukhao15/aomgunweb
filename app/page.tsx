@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import {
   createUserWithEmailAndPassword,
   GoogleAuthProvider,
-  OAuthProvider,
   onAuthStateChanged,
+  sendPasswordResetEmail,
   signOut,
   signInWithEmailAndPassword,
   signInWithPopup,
@@ -94,14 +94,43 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [qrImage, setQrImage] = useState("");
   const [parentInviteCode, setParentInviteCode] = useState("");
+  const [parentJoinCode, setParentJoinCode] = useState("");
   const [parentEmail, setParentEmail] = useState("");
   const [parentPassword, setParentPassword] = useState("");
   const [authReady, setAuthReady] = useState(false);
+  const [parentPanel, setParentPanel] = useState<"" | "allowance" | "budget" | "profile">("");
+  const [allowanceAmount, setAllowanceAmount] = useState("500");
+  const [allowanceNote, setAllowanceNote] = useState("Weekly allowance");
+  const [budgetDaily, setBudgetDaily] = useState("200");
+  const [budgetWeekly, setBudgetWeekly] = useState("1000");
+  const [budgetMonthly, setBudgetMonthly] = useState("3500");
+  const [expenseAmount, setExpenseAmount] = useState("");
+  const [expenseNote, setExpenseNote] = useState("");
+  const [expenseCategory, setExpenseCategory] = useState("Food & drink");
+  const [goalName, setGoalName] = useState("");
+  const [goalTarget, setGoalTarget] = useState("");
+  const [savingAmount, setSavingAmount] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [scannerMessage, setScannerMessage] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraStream = useRef<MediaStream | null>(null);
 
   const parentChildren = data?.role === "parent" && data.registered ? data.children ?? [] : [];
   const activeChild = parentChildren.find((child: any) => child.id === activeChildId) ?? parentChildren[0] ?? null;
   const childRecord = data?.role === "child" ? data.child : null;
   const liveTransactions = data?.transactions ?? [];
+  const liveGoals = data?.goals ?? [];
+
+  const spendingByCategory = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const item of liveTransactions) {
+      if (Number(item.amount) >= 0) continue;
+      const category = String(item.category ?? "Other");
+      totals.set(category, (totals.get(category) ?? 0) + Math.abs(Number(item.amount)));
+    }
+    return [...totals.entries()].sort((a, b) => b[1] - a[1]);
+  }, [liveTransactions]);
 
   useEffect(() => {
     const invite = new URLSearchParams(window.location.search).get("invite");
@@ -124,6 +153,10 @@ export default function Home() {
   useEffect(() => {
     if (!activeChildId && parentChildren[0]?.id) setActiveChildId(String(parentChildren[0].id));
   }, [activeChildId, parentChildren]);
+
+  useEffect(() => () => {
+    cameraStream.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   const screenTitle = useMemo(() => ({
     welcome: "Choose your path", register: "Create your account", parent: "Family dashboard",
@@ -224,7 +257,7 @@ export default function Home() {
     }
   }
 
-  async function signInProvider(provider: GoogleAuthProvider | OAuthProvider) {
+  async function signInProvider(provider: GoogleAuthProvider) {
     setBusy(true);
     try {
       await signInWithPopup(firebaseAuth, provider);
@@ -282,9 +315,8 @@ export default function Home() {
 
   async function joinAsParent() {
     if (!firebaseAuth.currentUser) return setToast("Sign in first, then use your parent invite code");
-    const invite = window.prompt("Enter the parent invite code");
-    if (!invite) return;
-    const result = await runAction("joinAsParent", { code: invite.toUpperCase() });
+    if (!parentJoinCode) return setToast("Enter your parent invite code");
+    const result = await runAction("joinAsParent", { code: parentJoinCode.toUpperCase() });
     if (result) navigate("parent");
   }
 
@@ -295,30 +327,111 @@ export default function Home() {
 
   async function sendAllowance() {
     if (!activeChild) return setToast("Add a child first");
-    const value = window.prompt(`Allowance for ${activeChild.name} (THB)`, "500");
-    if (!value) return;
-    const result = await runAction("sendAllowance", { childId: activeChild.id, amount: Number(value), note: "Weekly allowance" });
+    const result = await runAction("sendAllowance", { childId: activeChild.id, amount: Number(allowanceAmount), note: allowanceNote });
     if (result) setToast("Allowance sent and saved");
+    if (result) setParentPanel("");
   }
 
   async function setBudgets() {
     if (!activeChild) return setToast("Add a child first");
-    const daily = window.prompt("Daily budget (THB)", String(Number(activeChild.daily_budget) / 100));
-    if (!daily) return;
-    const weekly = window.prompt("Weekly budget (THB)", String(Number(activeChild.weekly_budget) / 100));
-    if (!weekly) return;
-    const monthly = window.prompt("Monthly budget (THB)", String(Number(activeChild.monthly_budget) / 100));
-    if (!monthly) return;
-    const result = await runAction("setBudgets", { childId: activeChild.id, daily: Number(daily), weekly: Number(weekly), monthly: Number(monthly) });
+    const result = await runAction("setBudgets", { childId: activeChild.id, daily: Number(budgetDaily), weekly: Number(budgetWeekly), monthly: Number(budgetMonthly) });
     if (result) setToast("Budgets updated securely");
+    if (result) setParentPanel("");
   }
 
   async function addExpense() {
-    const amount = window.prompt("Expense amount (THB)", "85");
-    if (!amount) return;
-    const note = window.prompt("What did you buy?", "Bubble tea") ?? "Expense";
-    const result = await runAction("recordExpense", { amount: Number(amount), category: "Food & drink", note });
-    if (result) setToast("Expense saved");
+    const result = await runAction("recordExpense", { amount: Number(expenseAmount), category: expenseCategory, note: expenseNote || "Expense" });
+    if (result) { setToast("Expense saved"); setExpenseAmount(""); setExpenseNote(""); setChildTab("Activity"); }
+  }
+
+  async function saveParentProfile() {
+    const result = await runAction("updateParentProfile", { name: parentName, familyName });
+    if (result) { setParentPanel(""); setToast("Profile updated"); }
+  }
+
+  async function resetParentPassword() {
+    if (!firebaseAuth.currentUser?.email) return;
+    try { await sendPasswordResetEmail(firebaseAuth, firebaseAuth.currentUser.email); setToast("Password reset email sent"); }
+    catch { setToast("Could not send the reset email"); }
+  }
+
+  async function logoutChild() {
+    const result = await runAction("logoutChild");
+    if (result) { setData(null); setPin(""); navigate("welcome"); setToast("Signed out successfully"); }
+  }
+
+  async function changeChildPin() {
+    const result = await runAction("changeChildPin", { pin: newPin });
+    if (result) { setNewPin(""); setToast("PIN changed successfully"); }
+  }
+
+  async function createGoal() {
+    const result = await runAction("createSavingsGoal", { name: goalName, targetAmount: Number(goalTarget) });
+    if (result) { setGoalName(""); setGoalTarget(""); setToast("Savings goal created"); }
+  }
+
+  async function saveToGoal(goalId: string) {
+    const result = await runAction("saveTowardGoal", { goalId, amount: Number(savingAmount) });
+    if (result) { setSavingAmount(""); setToast("Money moved to savings"); }
+  }
+
+  function openAllowancePanel() {
+    if (!activeChild) return setToast("Add a child first");
+    setAllowanceAmount("500"); setAllowanceNote("Weekly allowance"); setParentPanel("allowance");
+  }
+
+  function openBudgetPanel() {
+    if (!activeChild) return setToast("Add a child first");
+    openBudgetPanelFor(activeChild);
+  }
+
+  function openBudgetPanelFor(child: any) {
+    setActiveChildId(String(child.id));
+    setBudgetDaily(String(Number(child.daily_budget ?? 0) / 100));
+    setBudgetWeekly(String(Number(child.weekly_budget ?? 0) / 100));
+    setBudgetMonthly(String(Number(child.monthly_budget ?? 0) / 100));
+    setParentPanel("budget");
+  }
+
+  async function shareChildInvite() {
+    const joinUrl = `${window.location.origin}/?invite=${encodeURIComponent(inviteCode)}`;
+    if (navigator.share) await navigator.share({ title: "Join AomGun Family", text: `Use code ${inviteCode}`, url: joinUrl });
+    else { await navigator.clipboard?.writeText(joinUrl); setToast("Invite link copied"); }
+  }
+
+  function stopCamera() {
+    cameraStream.current?.getTracks().forEach((track) => track.stop());
+    cameraStream.current = null;
+    setCameraOpen(false);
+  }
+
+  async function openCamera() {
+    setScannerMessage("");
+    if (!navigator.mediaDevices?.getUserMedia) return setToast("Camera is not available in this browser");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      cameraStream.current = stream;
+      setCameraOpen(true);
+      window.setTimeout(async () => {
+        if (!videoRef.current) return;
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        const Detector = (window as any).BarcodeDetector;
+        if (!Detector) { setScannerMessage("QR detection is not supported here. Enter the code manually."); return; }
+        const detector = new Detector({ formats: ["qr_code"] });
+        const scan = async () => {
+          if (!cameraStream.current || !videoRef.current) return;
+          try {
+            const results = await detector.detect(videoRef.current);
+            const raw = String(results[0]?.rawValue ?? "");
+            const invite = raw.includes("invite=") ? new URL(raw).searchParams.get("invite") : raw.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/i)?.[0];
+            if (invite) { setCode(invite.toUpperCase()); stopCamera(); navigate("pin"); return; }
+          } catch { /* keep scanning */ }
+          window.requestAnimationFrame(scan);
+        };
+        void scan();
+      }, 50);
+    } catch { setToast("Camera permission was not granted"); }
   }
 
   function copyCode() {
@@ -372,12 +485,11 @@ export default function Home() {
               <div className="page-heading"><span className="kicker">FOR PARENTS</span><h2>Let’s create your<br />family space</h2><p>Start in seconds. Your family is created automatically.</p></div>
               <div className="auth-stack">
                 <button className="social-button" disabled={busy} onClick={() => signInProvider(new GoogleAuthProvider())}><span className="google">G</span>Continue with Google</button>
-                <button className="social-button apple" disabled={busy} onClick={() => signInProvider(new OAuthProvider("apple.com"))}><span>●</span>Continue with Apple</button>
                 <div className="divider"><span>or use email</span></div>
                 <label>Email address<input type="email" autoComplete="email" value={parentEmail} onChange={(event) => setParentEmail(event.target.value)} placeholder="parent@example.com" aria-label="Email address" /></label>
                 <label>Password<input type="password" autoComplete="current-password" value={parentPassword} onChange={(event) => setParentPassword(event.target.value)} placeholder="At least 6 characters" aria-label="Password" /></label>
                 <button className="primary" disabled={busy} onClick={signInEmail}>{busy ? "Signing in…" : "Continue"}</button>
-                <button className="secondary-link" onClick={joinAsParent}>I have a parent invite code</button>
+                <details className="parent-join"><summary>I have a parent invite code</summary><label>Parent invite code<input value={parentJoinCode} onChange={(event) => setParentJoinCode(event.target.value.toUpperCase())} placeholder="ABCD-2345" maxLength={9} /></label><button type="button" onClick={joinAsParent}>Join this family</button></details>
               </div>
             </>}
             {registerStep === 2 && <>
@@ -399,17 +511,17 @@ export default function Home() {
         {screen === "parent" && (
           <div className="dashboard-view parent-dashboard">
             <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><div className="parent-head-actions"><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button><button className="logout-button" disabled={busy} onClick={logoutParent} aria-label="Sign out">ออกจากระบบ</button></div></div>
-            <div className="parent-team"><div><span className="muted">Parents</span><div className="parent-chips">{(data?.members ?? []).map((member: any) => <span className="parent-chip" key={member.id}><i>{String(member.display_name ?? "P").slice(0,1).toUpperCase()}</i><b>{member.display_name}</b><small>{member.role === "owner" ? "Owner" : "Parent"}</small></span>)}</div></div><button onClick={createParentInvite} aria-label="Invite another parent">+</button></div>
-            {parentInviteCode && <div className="parent-invite-banner"><span>Parent invite</span><b>{parentInviteCode}</b><button onClick={() => navigator.clipboard?.writeText(parentInviteCode)}>Copy</button></div>}
-            <div className="family-strip"><div className="family-selector">{parentChildren.map((child: any) => <button className={`member ${activeChild?.id === child.id ? "active" : ""}`} onClick={() => setActiveChildId(String(child.id))} key={child.id}><span>{child.avatar}</span><small>{child.nickname ?? child.name}</small></button>)}<button className="member add" onClick={() => { setInviteReady(false); navigate("add-child"); }}><span>+</span><small>Add</small></button></div></div>
-            <div className="overview-card">
-              <div className="overview-title"><span>This month</span><button aria-label="Toggle balance"><Icon name="eye" /></button></div>
-              <h3>{money(activeChild?.received ?? 0)}</h3><p>Total allowance sent</p>
-              <div className="stats-row"><div><i className="green">↓</i><span><small>Balance</small><b>{money(activeChild?.balance ?? 0)}</b></span></div><div><i className="red">↑</i><span><small>Spent</small><b>{money(activeChild?.spent ?? 0)}</b></span></div></div>
-            </div>
-            <div className="quick-actions"><button onClick={sendAllowance}><i className="qa-purple">↗</i><span>Send<br />allowance</span></button><button onClick={setBudgets}><i className="qa-blue">▥</i><span>Set<br />budget</span></button><button><i className="qa-green">◎</i><span>View<br />savings</span></button></div>
-            <section className="spending-card"><div className="section-title"><div><h3>Spending</h3><span>June overview</span></div><button>Details</button></div><div className="chart-row"><div className="donut"><span>฿2.4k<small>spent</small></span></div><ul><li><i className="blue-dot" />Food <b>45%</b></li><li><i className="purple-dot" />Fun <b>30%</b></li><li><i className="yellow-dot" />Travel <b>25%</b></li></ul></div></section>
-            <section className="recent"><div className="section-title"><h3>Recent activity</h3><button>See all</button></div>{liveTransactions.filter((item: any) => !activeChild || item.child_id === activeChild.id).slice(0,3).map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">No activity yet</p>}</section>
+            {parentTab === "Home" && <>
+              <ParentTeam data={data} parentInviteCode={parentInviteCode} createParentInvite={createParentInvite} />
+              <ChildSelector children={parentChildren} activeChild={activeChild} setActiveChildId={setActiveChildId} add={() => { setInviteReady(false); navigate("add-child"); }} />
+              <div className="overview-card"><div className="overview-title"><span>This month</span><button aria-label="Toggle balance"><Icon name="eye" /></button></div><h3>{money(activeChild?.received ?? 0)}</h3><p>Total allowance sent</p><div className="stats-row"><div><i className="green">↓</i><span><small>Balance</small><b>{money(activeChild?.balance ?? 0)}</b></span></div><div><i className="red">↑</i><span><small>Spent</small><b>{money(activeChild?.spent ?? 0)}</b></span></div></div></div>
+              <div className="quick-actions"><button onClick={openAllowancePanel}><i className="qa-purple">↗</i><span>Send<br />allowance</span></button><button onClick={openBudgetPanel}><i className="qa-blue">▥</i><span>Set<br />budget</span></button><button onClick={() => setParentTab("Savings")}><i className="qa-green">◎</i><span>View<br />savings</span></button></div>
+              <section className="recent"><div className="section-title"><h3>Recent activity</h3><button onClick={() => setParentTab("Insights")}>See all</button></div>{liveTransactions.filter((item: any) => !activeChild || item.child_id === activeChild.id).slice(0,3).map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">No activity yet</p>}</section>
+            </>}
+            {parentTab === "Insights" && <div className="tab-page"><PageTitle eyebrow="FAMILY REPORT" title="Insights" text="See spending and allowance activity across every child." /><div className="summary-grid"><Metric label="Total balance" value={money(parentChildren.reduce((sum: number, child: any) => sum + Number(child.balance), 0))} tone="blue" /><Metric label="Total spent" value={money(parentChildren.reduce((sum: number, child: any) => sum + Number(child.spent), 0))} tone="red" /></div><section className="panel-card"><h3>Spending by category</h3>{spendingByCategory.length ? spendingByCategory.map(([category, amount]) => <div className="category-row" key={category}><span>{category}</span><div><i style={{width:`${Math.min(100, amount / Math.max(1, spendingByCategory[0][1]) * 100)}%`}} /></div><b>{money(amount)}</b></div>) : <p className="empty-state">No spending recorded yet</p>}</section><section className="panel-card"><h3>All activity</h3>{liveTransactions.map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}</section></div>}
+            {parentTab === "Budgets" && <div className="tab-page"><PageTitle eyebrow="SPENDING LIMITS" title="Budgets" text="Set daily, weekly and monthly limits for each child." />{parentChildren.map((child: any) => <section className="child-manage-card" key={child.id}><div><span>{child.avatar}</span><h3>{child.nickname ?? child.name}</h3></div><dl><div><dt>Daily</dt><dd>{money(child.daily_budget)}</dd></div><div><dt>Weekly</dt><dd>{money(child.weekly_budget)}</dd></div><div><dt>Monthly</dt><dd>{money(child.monthly_budget)}</dd></div></dl><button onClick={() => openBudgetPanelFor(child)}>Edit budget</button></section>)}{!parentChildren.length && <p className="empty-state">Add a child to set budgets</p>}</div>}
+            {parentTab === "Savings" && <div className="tab-page"><PageTitle eyebrow="GOALS" title="Family savings" text="Follow every child’s progress toward their goals." />{liveGoals.map((goal: any) => <section className="goal-list-card" key={goal.id}><div><span>🎯</span><div><small>{goal.child_name}</small><h3>{goal.name}</h3></div><b>{goalPercent(goal)}%</b></div><div className="progress"><i style={{width:`${goalPercent(goal)}%`}} /></div><p>{money(goal.saved_amount)} of {money(goal.target_amount)}</p></section>)}{!liveGoals.length && <p className="empty-state">Savings goals will appear here</p>}</div>}
+            {parentTab === "Family" && <div className="tab-page"><PageTitle eyebrow="MEMBERS" title={String(data?.family?.name ?? familyName)} text="Manage parents, children and your family profile." /><ParentTeam data={data} parentInviteCode={parentInviteCode} createParentInvite={createParentInvite} />{parentChildren.map((child: any) => <section className="member-row-card" key={child.id}><span>{child.avatar}</span><div><h3>{child.nickname ?? child.name}</h3><p>Age {child.age} · Balance {money(child.balance)}</p></div></section>)}<div className="settings-actions"><button onClick={() => { setParentName(data?.identity?.displayName ?? parentName); setFamilyName(data?.family?.name ?? familyName); setParentPanel("profile"); }}>Edit family profile</button><button onClick={resetParentPassword}>Send password reset email</button><button className="danger" onClick={logoutParent}>ออกจากระบบ</button></div></div>}
             <BottomNav active={parentTab} onSelect={setParentTab} parent />
           </div>
         )}
@@ -429,7 +541,7 @@ export default function Home() {
               <div className="code-box"><small>INVITE CODE</small><b>{inviteCode}</b><button onClick={copyCode} aria-label="Copy invite code"><Icon name="copy" /></button></div>
               <div className="expiry">◷ Expires in 24 hours</div>
               <button className="primary" onClick={() => navigate("parent")}>Done</button>
-              <button className="secondary-link" onClick={() => setToast("Share sheet opened")}>Share invite</button>
+              <button className="secondary-link" onClick={shareChildInvite}>Share invite</button>
             </div>}
           </div>
         )}
@@ -442,7 +554,7 @@ export default function Home() {
             <label className="code-input-label">Family invite code<input value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} placeholder="MILO-4821" maxLength={9} /></label>
             <button className="primary child-primary" disabled={code.length < 4} onClick={() => navigate("pin")}>Join family</button>
             <div className="or"><span>or</span></div>
-            <button className="scan-button" onClick={() => setToast("Camera scanning is available after HTTPS deployment")}><Icon name="scan" /> Scan QR code</button>
+            <button className="scan-button" onClick={openCamera}><Icon name="scan" /> Scan QR code</button>
             <p className="child-safe">◆ You’ll only see your own money — never anyone else’s.</p>
           </div>
         )}
@@ -466,23 +578,37 @@ export default function Home() {
               <div className="balance-card"><div><span>My balance <button aria-label="Toggle balance"><Icon name="eye" /></button></span><h2>{money(childRecord?.balance ?? 0)}</h2><small>Stored securely for this profile</small></div><div className="piggy">🐷<i>฿</i></div></div>
             </div>
             <div className="child-content">
-              <div className="budget-cards"><div className="budget-card"><div><span>Today’s budget</span><b>{money(childRecord?.daily_budget ?? 0)}</b></div><strong>Live</strong><div className="progress"><i style={{width:"25%"}} /></div></div><div className="budget-card goal-card"><div><span>Saving goal</span><b>{data?.goals?.[0]?.name ?? "New bicycle"} 🚲</b></div><strong>{goalPercent(data?.goals?.[0])}%</strong><div className="progress"><i style={{width:`${goalPercent(data?.goals?.[0])}%`}} /></div></div></div>
-              <div className="quick-actions child-actions"><button onClick={addExpense}><i>＋</i><span>Add expense</span></button><button><i>◎</i><span>My savings</span></button><button><i>☷</i><span>All activity</span></button></div>
-              <section className="streak"><div className="streak-star">★</div><div><small>YOUR MONEY STREAK</small><h3>5 days of tracking!</h3><p>Two more days to unlock a badge.</p></div><span>🔥</span></section>
-              <section className="recent"><div className="section-title"><h3>My activity</h3><button>See all</button></div>{liveTransactions.map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">Your activity will appear here</p>}</section>
+              {childTab === "Home" && <><div className="budget-cards"><div className="budget-card"><div><span>Today’s budget</span><b>{money(childRecord?.daily_budget ?? 0)}</b></div><strong>Live</strong><div className="progress"><i style={{width:"25%"}} /></div></div><div className="budget-card goal-card"><div><span>Saving goal</span><b>{liveGoals[0]?.name ?? "Create a goal"} 🎯</b></div><strong>{goalPercent(liveGoals[0])}%</strong><div className="progress"><i style={{width:`${goalPercent(liveGoals[0])}%`}} /></div></div></div><div className="quick-actions child-actions"><button onClick={() => setChildTab("Add")}><i>＋</i><span>Add expense</span></button><button onClick={() => setChildTab("Goals")}><i>◎</i><span>My savings</span></button><button onClick={() => setChildTab("Activity")}><i>☷</i><span>All activity</span></button></div><section className="streak"><div className="streak-star">★</div><div><small>YOUR MONEY HABIT</small><h3>{liveTransactions.length} records tracked</h3><p>Keep logging to understand your spending.</p></div><span>🔥</span></section><section className="recent"><div className="section-title"><h3>My activity</h3><button onClick={() => setChildTab("Activity")}>See all</button></div>{liveTransactions.slice(0,3).map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">Your activity will appear here</p>}</section></>}
+              {childTab === "Activity" && <div className="tab-page child-tab"><PageTitle eyebrow="MY RECORDS" title="Activity" text="Everything you receive, spend and save." /><section className="panel-card">{liveTransactions.map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}{!liveTransactions.length && <p className="empty-state">No activity yet</p>}</section></div>}
+              {childTab === "Add" && <div className="tab-page child-tab"><PageTitle eyebrow="NEW RECORD" title="Add expense" text="Record what you spent so your balance stays accurate." /><div className="action-form"><label>Amount (THB)<input inputMode="decimal" value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="85" /></label><label>Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)}><option>Food & drink</option><option>Travel</option><option>Fun</option><option>School</option><option>Shopping</option><option>Other</option></select></label><label>What did you buy?<input value={expenseNote} onChange={(event) => setExpenseNote(event.target.value)} placeholder="Bubble tea" /></label><button className="primary" disabled={busy || !expenseAmount} onClick={addExpense}>{busy ? "Saving…" : "Save expense"}</button></div></div>}
+              {childTab === "Goals" && <div className="tab-page child-tab"><PageTitle eyebrow="MY SAVINGS" title="Goals" text="Choose something meaningful and save a little at a time." />{liveGoals.map((goal: any) => <section className="goal-list-card" key={goal.id}><div><span>🎯</span><div><h3>{goal.name}</h3><small>{money(goal.saved_amount)} of {money(goal.target_amount)}</small></div><b>{goalPercent(goal)}%</b></div><div className="progress"><i style={{width:`${goalPercent(goal)}%`}} /></div><div className="goal-save"><input inputMode="decimal" value={savingAmount} onChange={(event) => setSavingAmount(event.target.value)} placeholder="Amount" /><button onClick={() => saveToGoal(goal.id)} disabled={busy || !savingAmount}>Save</button></div></section>)}<div className="action-form compact-form"><h3>Create a new goal</h3><label>Goal name<input value={goalName} onChange={(event) => setGoalName(event.target.value)} placeholder="New bicycle" /></label><label>Target (THB)<input inputMode="decimal" value={goalTarget} onChange={(event) => setGoalTarget(event.target.value)} placeholder="12000" /></label><button className="primary" disabled={busy || !goalName || !goalTarget} onClick={createGoal}>Create goal</button></div></div>}
+              {childTab === "Me" && <div className="tab-page child-tab"><PageTitle eyebrow="MY PROFILE" title={String(childRecord?.nickname ?? nickname)} text={`Member of ${String(childRecord?.family_name ?? "my family")}`} /><section className="profile-card"><span>{childRecord?.avatar ?? avatars[avatar]}</span><h3>{childRecord?.name}</h3><p>Age {childRecord?.age} · Your records are private</p></section><div className="action-form compact-form"><h3>Change 4-digit PIN</h3><label>New PIN<input type="password" inputMode="numeric" maxLength={4} value={newPin} onChange={(event) => setNewPin(event.target.value.replace(/\D/g, ""))} placeholder="••••" /></label><button className="primary" disabled={busy || newPin.length !== 4} onClick={changeChildPin}>Change PIN</button></div><button className="full-danger" onClick={logoutChild}>ออกจากระบบเด็ก</button></div>}
             </div>
             <BottomNav active={childTab} onSelect={setChildTab} />
           </div>
         )}
+        {parentPanel && <div className="modal-backdrop" role="presentation"><section className="sheet" role="dialog" aria-modal="true"><div className="sheet-head"><h3>{parentPanel === "allowance" ? `Send allowance to ${activeChild?.name}` : parentPanel === "budget" ? `Budget for ${activeChild?.name}` : "Family profile"}</h3><button onClick={() => setParentPanel("")} aria-label="Close">×</button></div>{parentPanel === "allowance" && <div className="action-form"><label>Amount (THB)<input inputMode="decimal" value={allowanceAmount} onChange={(event) => setAllowanceAmount(event.target.value)} /></label><label>Note<input value={allowanceNote} onChange={(event) => setAllowanceNote(event.target.value)} /></label><button className="primary" disabled={busy || !allowanceAmount} onClick={sendAllowance}>Confirm allowance</button></div>}{parentPanel === "budget" && <div className="action-form"><label>Daily budget<input inputMode="decimal" value={budgetDaily} onChange={(event) => setBudgetDaily(event.target.value)} /></label><label>Weekly budget<input inputMode="decimal" value={budgetWeekly} onChange={(event) => setBudgetWeekly(event.target.value)} /></label><label>Monthly budget<input inputMode="decimal" value={budgetMonthly} onChange={(event) => setBudgetMonthly(event.target.value)} /></label><button className="primary" disabled={busy} onClick={setBudgets}>Save budgets</button></div>}{parentPanel === "profile" && <div className="action-form"><label>Your name<input value={parentName} onChange={(event) => setParentName(event.target.value)} /></label><label>Family name<input value={familyName} onChange={(event) => setFamilyName(event.target.value)} /></label><button className="primary" disabled={busy} onClick={saveParentProfile}>Save profile</button></div>}</section></div>}
+        {cameraOpen && <div className="modal-backdrop"><section className="camera-sheet"><div className="sheet-head"><h3>Scan family QR</h3><button onClick={stopCamera}>×</button></div><video ref={videoRef} playsInline muted /><p>{scannerMessage || "Point the camera at the QR code"}</p></section></div>}
         {toast && <div className="toast" role="status">✓ {toast}</div>}
       </section>
-      <aside className="prototype-nav" aria-label="Prototype screens">
-        <Brand /><p>Interactive prototype</p>
-        {[["welcome","Welcome"],["register","Parent registration"],["parent","Parent dashboard"],["add-child","Add child"],["join","Child join"],["pin","Create PIN"],["child","Child dashboard"]].map(([id,label]) => <button className={screen === id ? "active" : ""} onClick={() => navigate(id as Screen)} key={id}><span>{label}</span><i>→</i></button>)}
-        <div className="prototype-note"><b>Privacy by design</b><span>Child profiles are scoped to their own records. Sibling data is never exposed.</span></div>
-      </aside>
     </main>
   );
+}
+
+function PageTitle({ eyebrow, title, text }: { eyebrow: string; title: string; text: string }) {
+  return <div className="tab-title"><span>{eyebrow}</span><h2>{title}</h2><p>{text}</p></div>;
+}
+
+function Metric({ label, value, tone }: { label: string; value: string; tone: string }) {
+  return <div className={`metric ${tone}`}><span>{label}</span><b>{value}</b></div>;
+}
+
+function ParentTeam({ data, parentInviteCode, createParentInvite }: { data: any; parentInviteCode: string; createParentInvite: () => void }) {
+  return <><div className="parent-team"><div><span className="muted">Parents</span><div className="parent-chips">{(data?.members ?? []).map((member: any) => <span className="parent-chip" key={member.id}><i>{String(member.display_name ?? "P").slice(0,1).toUpperCase()}</i><b>{member.display_name}</b><small>{member.role === "owner" ? "Owner" : "Parent"}</small></span>)}</div></div><button onClick={createParentInvite} aria-label="Invite another parent">+</button></div>{parentInviteCode && <div className="parent-invite-banner"><span>Parent invite</span><b>{parentInviteCode}</b><button onClick={() => navigator.clipboard?.writeText(parentInviteCode)}>Copy</button></div>}</>;
+}
+
+function ChildSelector({ children, activeChild, setActiveChildId, add }: { children: any[]; activeChild: any; setActiveChildId: (id: string) => void; add: () => void }) {
+  return <div className="family-strip"><div className="family-selector">{children.map((child: any) => <button className={`member ${activeChild?.id === child.id ? "active" : ""}`} onClick={() => setActiveChildId(String(child.id))} key={child.id}><span>{child.avatar}</span><small>{child.nickname ?? child.name}</small></button>)}<button className="member add" onClick={add}><span>+</span><small>Add</small></button></div></div>;
 }
 
 function Transaction({ icon, title, meta, amount, negative }: { icon: string; title: string; meta: string; amount: string; negative: boolean }) {
@@ -490,6 +616,6 @@ function Transaction({ icon, title, meta, amount, negative }: { icon: string; ti
 }
 
 function BottomNav({ active, onSelect, parent = false }: { active: string; onSelect: (v: string) => void; parent?: boolean }) {
-  const items = parent ? [["Home","⌂"],["Insights","⌁"],["Budgets","▥"],["Family","♙"]] : [["Home","⌂"],["Activity","☷"],["Add","+"],["Goals","◇"],["Me","♙"]];
+  const items = parent ? [["Home","⌂"],["Insights","⌁"],["Budgets","▥"],["Savings","◇"],["Family","♙"]] : [["Home","⌂"],["Activity","☷"],["Add","+"],["Goals","◇"],["Me","♙"]];
   return <nav className="bottom-nav">{items.map(([label,icon]) => <button key={label} aria-label={label} className={`${active === label ? "active" : ""} ${label === "Add" ? "nav-add" : ""}`} onClick={() => onSelect(label)}><i>{icon}</i><span>{label}</span></button>)}</nav>;
 }
