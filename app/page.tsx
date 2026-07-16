@@ -98,7 +98,8 @@ export default function Home() {
   const [parentEmail, setParentEmail] = useState("");
   const [parentPassword, setParentPassword] = useState("");
   const [authReady, setAuthReady] = useState(false);
-  const [parentPanel, setParentPanel] = useState<"" | "allowance" | "budget" | "profile">("");
+  const [parentPanel, setParentPanel] = useState<"" | "allowance" | "budget" | "profile" | "invite">("");
+  const [language, setLanguage] = useState<"th" | "en">("th");
   const [allowanceAmount, setAllowanceAmount] = useState("500");
   const [allowanceNote, setAllowanceNote] = useState("Weekly allowance");
   const [budgetDaily, setBudgetDaily] = useState("200");
@@ -133,6 +134,8 @@ export default function Home() {
   }, [liveTransactions]);
 
   useEffect(() => {
+    const savedLanguage = window.localStorage.getItem("aomgun_language");
+    if (savedLanguage === "en" || savedLanguage === "th") setLanguage(savedLanguage);
     const invite = new URLSearchParams(window.location.search).get("invite");
     if (invite) {
       setCode(invite.toUpperCase());
@@ -167,6 +170,12 @@ export default function Home() {
     setScreen(next);
     setToast("");
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function toggleLanguage() {
+    const next = language === "th" ? "en" : "th";
+    setLanguage(next);
+    window.localStorage.setItem("aomgun_language", next);
   }
 
   async function authHeaders(): Promise<Record<string, string>> {
@@ -313,6 +322,17 @@ export default function Home() {
     }
   }
 
+  async function regenerateChildInvite(child: any) {
+    const result = await runAction("regenerateChildInvite", { childId: child.id });
+    if (result) {
+      setActiveChildId(String(child.id));
+      setInviteCode(result.code);
+      setChildName(String(child.name));
+      setParentPanel("invite");
+      setToast(language === "th" ? "สร้างรหัสใหม่แล้ว รหัสเก่าถูกยกเลิก" : "New code created; the old code was revoked");
+    }
+  }
+
   async function joinAsParent() {
     if (!firebaseAuth.currentUser) return setToast("Sign in first, then use your parent invite code");
     if (!parentJoinCode) return setToast("Enter your parent invite code");
@@ -453,7 +473,7 @@ export default function Home() {
 
         {screen === "welcome" && (
           <div className="welcome-view">
-            <div className="welcome-top"><Brand /><button className="text-link" onClick={() => navigate("register")}>{authReady ? "Sign in" : "Loading…"}</button></div>
+            <div className="welcome-top"><Brand /><div className="top-actions"><button className="language-toggle" onClick={toggleLanguage}>{language === "th" ? "EN" : "ไทย"}</button><button className="text-link" onClick={() => navigate("register")}>{authReady ? (language === "th" ? "เข้าสู่ระบบ" : "Sign in") : "Loading…"}</button></div></div>
             <div className="hero-art" aria-hidden="true">
               <div className="orbit orbit-one" /><div className="orbit orbit-two" />
               <div className="family-card parent-mini"><span>👩🏻</span><i>Parent</i></div>
@@ -468,10 +488,10 @@ export default function Home() {
             </div>
             <div className="role-actions">
               <button className="role-card parent-role" onClick={openParent}>
-                <span className="role-icon">👩🏻‍💼</span><span><b>I’m a Parent</b><small>Create & manage a family</small></span><strong>→</strong>
+                <span className="role-icon">👩🏻‍💼</span><span><b>{language === "th" ? "ฉันเป็นผู้ปกครอง" : "I’m a Parent"}</b><small>{language === "th" ? "สร้างและดูแลครอบครัว" : "Create & manage a family"}</small></span><strong>→</strong>
               </button>
               <button className="role-card child-role" onClick={() => navigate("join")}>
-                <span className="role-icon">🧒🏻</span><span><b>I’m a Child</b><small>Join with a family code</small></span><strong>→</strong>
+                <span className="role-icon">🧒🏻</span><span><b>{language === "th" ? "ฉันเป็นเด็ก" : "I’m a Child"}</b><small>{language === "th" ? "เข้าร่วมด้วยรหัสครอบครัว" : "Join with a family code"}</small></span><strong>→</strong>
               </button>
             </div>
             <p className="privacy-note"><Icon name="shield" /> Private, secure and made for families</p>
@@ -510,7 +530,7 @@ export default function Home() {
 
         {screen === "parent" && (
           <div className="dashboard-view parent-dashboard">
-            <div className="dashboard-head"><div><span className="muted">Good morning,</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><div className="parent-head-actions"><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button><button className="logout-button" disabled={busy} onClick={logoutParent} aria-label="Sign out">ออกจากระบบ</button></div></div>
+            <div className="dashboard-head"><div><span className="muted">{language === "th" ? "สวัสดี" : "Good morning,"}</span><h2>{data?.identity?.displayName ?? parentName} <span>👋</span></h2></div><div className="parent-head-actions"><button className="language-toggle" onClick={toggleLanguage}>{language === "th" ? "EN" : "ไทย"}</button><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button><button className="logout-button" disabled={busy} onClick={logoutParent} aria-label="Sign out">{language === "th" ? "ออก" : "Sign out"}</button></div></div>
             {parentTab === "Home" && <>
               <ParentTeam data={data} parentInviteCode={parentInviteCode} createParentInvite={createParentInvite} />
               <ChildSelector children={parentChildren} activeChild={activeChild} setActiveChildId={setActiveChildId} add={() => { setInviteReady(false); navigate("add-child"); }} />
@@ -521,8 +541,8 @@ export default function Home() {
             {parentTab === "Insights" && <div className="tab-page"><PageTitle eyebrow="FAMILY REPORT" title="Insights" text="See spending and allowance activity across every child." /><div className="summary-grid"><Metric label="Total balance" value={money(parentChildren.reduce((sum: number, child: any) => sum + Number(child.balance), 0))} tone="blue" /><Metric label="Total spent" value={money(parentChildren.reduce((sum: number, child: any) => sum + Number(child.spent), 0))} tone="red" /></div><section className="panel-card"><h3>Spending by category</h3>{spendingByCategory.length ? spendingByCategory.map(([category, amount]) => <div className="category-row" key={category}><span>{category}</span><div><i style={{width:`${Math.min(100, amount / Math.max(1, spendingByCategory[0][1]) * 100)}%`}} /></div><b>{money(amount)}</b></div>) : <p className="empty-state">No spending recorded yet</p>}</section><section className="panel-card"><h3>All activity</h3>{liveTransactions.map((item: any) => <Transaction key={item.id} {...transactionView(item)} />)}</section></div>}
             {parentTab === "Budgets" && <div className="tab-page"><PageTitle eyebrow="SPENDING LIMITS" title="Budgets" text="Set daily, weekly and monthly limits for each child." />{parentChildren.map((child: any) => <section className="child-manage-card" key={child.id}><div><span>{child.avatar}</span><h3>{child.nickname ?? child.name}</h3></div><dl><div><dt>Daily</dt><dd>{money(child.daily_budget)}</dd></div><div><dt>Weekly</dt><dd>{money(child.weekly_budget)}</dd></div><div><dt>Monthly</dt><dd>{money(child.monthly_budget)}</dd></div></dl><button onClick={() => openBudgetPanelFor(child)}>Edit budget</button></section>)}{!parentChildren.length && <p className="empty-state">Add a child to set budgets</p>}</div>}
             {parentTab === "Savings" && <div className="tab-page"><PageTitle eyebrow="GOALS" title="Family savings" text="Follow every child’s progress toward their goals." />{liveGoals.map((goal: any) => <section className="goal-list-card" key={goal.id}><div><span>🎯</span><div><small>{goal.child_name}</small><h3>{goal.name}</h3></div><b>{goalPercent(goal)}%</b></div><div className="progress"><i style={{width:`${goalPercent(goal)}%`}} /></div><p>{money(goal.saved_amount)} of {money(goal.target_amount)}</p></section>)}{!liveGoals.length && <p className="empty-state">Savings goals will appear here</p>}</div>}
-            {parentTab === "Family" && <div className="tab-page"><PageTitle eyebrow="MEMBERS" title={String(data?.family?.name ?? familyName)} text="Manage parents, children and your family profile." /><ParentTeam data={data} parentInviteCode={parentInviteCode} createParentInvite={createParentInvite} />{parentChildren.map((child: any) => <section className="member-row-card" key={child.id}><span>{child.avatar}</span><div><h3>{child.nickname ?? child.name}</h3><p>Age {child.age} · Balance {money(child.balance)}</p></div></section>)}<div className="settings-actions"><button onClick={() => { setParentName(data?.identity?.displayName ?? parentName); setFamilyName(data?.family?.name ?? familyName); setParentPanel("profile"); }}>Edit family profile</button><button onClick={resetParentPassword}>Send password reset email</button><button className="danger" onClick={logoutParent}>ออกจากระบบ</button></div></div>}
-            <BottomNav active={parentTab} onSelect={setParentTab} parent />
+            {parentTab === "Family" && <div className="tab-page"><PageTitle eyebrow={language === "th" ? "สมาชิก" : "MEMBERS"} title={String(data?.family?.name ?? familyName)} text={language === "th" ? "จัดการผู้ปกครอง เด็ก และข้อมูลครอบครัว" : "Manage parents, children and your family profile."} /><ParentTeam data={data} parentInviteCode={parentInviteCode} createParentInvite={createParentInvite} />{parentChildren.map((child: any) => <section className="member-row-card" key={child.id}><span>{child.avatar}</span><div><h3>{child.nickname ?? child.name}</h3><p>{language === "th" ? `อายุ ${child.age} · คงเหลือ ${money(child.balance)}` : `Age ${child.age} · Balance ${money(child.balance)}`}</p></div><button className="new-code-button" onClick={() => regenerateChildInvite(child)}>{language === "th" ? "สร้างรหัสใหม่" : "New code"}</button></section>)}<div className="settings-actions"><button onClick={() => { setParentName(data?.identity?.displayName ?? parentName); setFamilyName(data?.family?.name ?? familyName); setParentPanel("profile"); }}>{language === "th" ? "แก้ไขข้อมูลครอบครัว" : "Edit family profile"}</button><button onClick={resetParentPassword}>{language === "th" ? "ส่งอีเมลรีเซ็ตรหัสผ่าน" : "Send password reset email"}</button><button className="danger" onClick={logoutParent}>{language === "th" ? "ออกจากระบบ" : "Sign out"}</button></div></div>}
+            <BottomNav active={parentTab} onSelect={setParentTab} parent language={language} />
           </div>
         )}
 
@@ -574,7 +594,7 @@ export default function Home() {
         {screen === "child" && (
           <div className="dashboard-view child-dashboard">
             <div className="child-hero">
-              <div className="dashboard-head"><div className="hello"><span className="child-avatar">{childRecord?.avatar ?? avatars[avatar]}</span><span><small>Hi, {childRecord?.nickname ?? nickname}!</small><b>Ready to grow? 🌱</b></span></div><button className="bell" aria-label="Notifications"><Icon name="bell" /><i /></button></div>
+              <div className="dashboard-head"><div className="hello"><span className="child-avatar">{childRecord?.avatar ?? avatars[avatar]}</span><span><small>{language === "th" ? "สวัสดี" : "Hi"}, {childRecord?.nickname ?? nickname}!</small><b>{language === "th" ? "พร้อมเรียนรู้เรื่องเงินไหม?" : "Ready to grow?"} 🌱</b></span></div><button className="language-toggle child-language" onClick={toggleLanguage}>{language === "th" ? "EN" : "ไทย"}</button></div>
               <div className="balance-card"><div><span>My balance <button aria-label="Toggle balance"><Icon name="eye" /></button></span><h2>{money(childRecord?.balance ?? 0)}</h2><small>Stored securely for this profile</small></div><div className="piggy">🐷<i>฿</i></div></div>
             </div>
             <div className="child-content">
@@ -584,10 +604,10 @@ export default function Home() {
               {childTab === "Goals" && <div className="tab-page child-tab"><PageTitle eyebrow="MY SAVINGS" title="Goals" text="Choose something meaningful and save a little at a time." />{liveGoals.map((goal: any) => <section className="goal-list-card" key={goal.id}><div><span>🎯</span><div><h3>{goal.name}</h3><small>{money(goal.saved_amount)} of {money(goal.target_amount)}</small></div><b>{goalPercent(goal)}%</b></div><div className="progress"><i style={{width:`${goalPercent(goal)}%`}} /></div><div className="goal-save"><input inputMode="decimal" value={savingAmount} onChange={(event) => setSavingAmount(event.target.value)} placeholder="Amount" /><button onClick={() => saveToGoal(goal.id)} disabled={busy || !savingAmount}>Save</button></div></section>)}<div className="action-form compact-form"><h3>Create a new goal</h3><label>Goal name<input value={goalName} onChange={(event) => setGoalName(event.target.value)} placeholder="New bicycle" /></label><label>Target (THB)<input inputMode="decimal" value={goalTarget} onChange={(event) => setGoalTarget(event.target.value)} placeholder="12000" /></label><button className="primary" disabled={busy || !goalName || !goalTarget} onClick={createGoal}>Create goal</button></div></div>}
               {childTab === "Me" && <div className="tab-page child-tab"><PageTitle eyebrow="MY PROFILE" title={String(childRecord?.nickname ?? nickname)} text={`Member of ${String(childRecord?.family_name ?? "my family")}`} /><section className="profile-card"><span>{childRecord?.avatar ?? avatars[avatar]}</span><h3>{childRecord?.name}</h3><p>Age {childRecord?.age} · Your records are private</p></section><div className="action-form compact-form"><h3>Change 4-digit PIN</h3><label>New PIN<input type="password" inputMode="numeric" maxLength={4} value={newPin} onChange={(event) => setNewPin(event.target.value.replace(/\D/g, ""))} placeholder="••••" /></label><button className="primary" disabled={busy || newPin.length !== 4} onClick={changeChildPin}>Change PIN</button></div><button className="full-danger" onClick={logoutChild}>ออกจากระบบเด็ก</button></div>}
             </div>
-            <BottomNav active={childTab} onSelect={setChildTab} />
+            <BottomNav active={childTab} onSelect={setChildTab} language={language} />
           </div>
         )}
-        {parentPanel && <div className="modal-backdrop" role="presentation"><section className="sheet" role="dialog" aria-modal="true"><div className="sheet-head"><h3>{parentPanel === "allowance" ? `Send allowance to ${activeChild?.name}` : parentPanel === "budget" ? `Budget for ${activeChild?.name}` : "Family profile"}</h3><button onClick={() => setParentPanel("")} aria-label="Close">×</button></div>{parentPanel === "allowance" && <div className="action-form"><label>Amount (THB)<input inputMode="decimal" value={allowanceAmount} onChange={(event) => setAllowanceAmount(event.target.value)} /></label><label>Note<input value={allowanceNote} onChange={(event) => setAllowanceNote(event.target.value)} /></label><button className="primary" disabled={busy || !allowanceAmount} onClick={sendAllowance}>Confirm allowance</button></div>}{parentPanel === "budget" && <div className="action-form"><label>Daily budget<input inputMode="decimal" value={budgetDaily} onChange={(event) => setBudgetDaily(event.target.value)} /></label><label>Weekly budget<input inputMode="decimal" value={budgetWeekly} onChange={(event) => setBudgetWeekly(event.target.value)} /></label><label>Monthly budget<input inputMode="decimal" value={budgetMonthly} onChange={(event) => setBudgetMonthly(event.target.value)} /></label><button className="primary" disabled={busy} onClick={setBudgets}>Save budgets</button></div>}{parentPanel === "profile" && <div className="action-form"><label>Your name<input value={parentName} onChange={(event) => setParentName(event.target.value)} /></label><label>Family name<input value={familyName} onChange={(event) => setFamilyName(event.target.value)} /></label><button className="primary" disabled={busy} onClick={saveParentProfile}>Save profile</button></div>}</section></div>}
+        {parentPanel && <div className="modal-backdrop" role="presentation"><section className="sheet" role="dialog" aria-modal="true"><div className="sheet-head"><h3>{parentPanel === "allowance" ? `Send allowance to ${activeChild?.name}` : parentPanel === "budget" ? `Budget for ${activeChild?.name}` : parentPanel === "invite" ? (language === "th" ? `รหัสใหม่ของ ${childName}` : `New code for ${childName}`) : "Family profile"}</h3><button onClick={() => setParentPanel("")} aria-label="Close">×</button></div>{parentPanel === "allowance" && <div className="action-form"><label>Amount (THB)<input inputMode="decimal" value={allowanceAmount} onChange={(event) => setAllowanceAmount(event.target.value)} /></label><label>Note<input value={allowanceNote} onChange={(event) => setAllowanceNote(event.target.value)} /></label><button className="primary" disabled={busy || !allowanceAmount} onClick={sendAllowance}>Confirm allowance</button></div>}{parentPanel === "budget" && <div className="action-form"><label>Daily budget<input inputMode="decimal" value={budgetDaily} onChange={(event) => setBudgetDaily(event.target.value)} /></label><label>Weekly budget<input inputMode="decimal" value={budgetWeekly} onChange={(event) => setBudgetWeekly(event.target.value)} /></label><label>Monthly budget<input inputMode="decimal" value={budgetMonthly} onChange={(event) => setBudgetMonthly(event.target.value)} /></label><button className="primary" disabled={busy} onClick={setBudgets}>Save budgets</button></div>}{parentPanel === "profile" && <div className="action-form"><label>Your name<input value={parentName} onChange={(event) => setParentName(event.target.value)} /></label><label>Family name<input value={familyName} onChange={(event) => setFamilyName(event.target.value)} /></label><button className="primary" disabled={busy} onClick={saveParentProfile}>Save profile</button></div>}{parentPanel === "invite" && <div className="renewed-invite"><p>{language === "th" ? "ส่งรหัสนี้ให้เด็ก รหัสมีอายุ 24 ชั่วโมง" : "Send this code to the child. It is valid for 24 hours."}</p>{qrImage && <img src={qrImage} alt="Child invite QR" />}<b>{inviteCode}</b><div><button onClick={() => navigator.clipboard?.writeText(inviteCode)}>{language === "th" ? "คัดลอกรหัส" : "Copy code"}</button><button onClick={shareChildInvite}>{language === "th" ? "แชร์" : "Share"}</button></div></div>}</section></div>}
         {cameraOpen && <div className="modal-backdrop"><section className="camera-sheet"><div className="sheet-head"><h3>Scan family QR</h3><button onClick={stopCamera}>×</button></div><video ref={videoRef} playsInline muted /><p>{scannerMessage || "Point the camera at the QR code"}</p></section></div>}
         {toast && <div className="toast" role="status">✓ {toast}</div>}
       </section>
@@ -615,7 +635,8 @@ function Transaction({ icon, title, meta, amount, negative }: { icon: string; ti
   return <div className="transaction"><span className="transaction-icon">{icon}</span><div><b>{title}</b><small>{meta}</small></div><strong className={negative ? "negative" : "positive"}>{amount}</strong></div>;
 }
 
-function BottomNav({ active, onSelect, parent = false }: { active: string; onSelect: (v: string) => void; parent?: boolean }) {
+function BottomNav({ active, onSelect, parent = false, language }: { active: string; onSelect: (v: string) => void; parent?: boolean; language: "th" | "en" }) {
   const items = parent ? [["Home","⌂"],["Insights","⌁"],["Budgets","▥"],["Savings","◇"],["Family","♙"]] : [["Home","⌂"],["Activity","☷"],["Add","+"],["Goals","◇"],["Me","♙"]];
-  return <nav className="bottom-nav">{items.map(([label,icon]) => <button key={label} aria-label={label} className={`${active === label ? "active" : ""} ${label === "Add" ? "nav-add" : ""}`} onClick={() => onSelect(label)}><i>{icon}</i><span>{label}</span></button>)}</nav>;
+  const thai: Record<string, string> = { Home: "หน้าหลัก", Insights: "ภาพรวม", Budgets: "งบ", Savings: "เงินออม", Family: "ครอบครัว", Activity: "รายการ", Add: "เพิ่ม", Goals: "เป้าหมาย", Me: "ฉัน" };
+  return <nav className="bottom-nav">{items.map(([label,icon]) => <button key={label} aria-label={language === "th" ? thai[label] : label} className={`${active === label ? "active" : ""} ${label === "Add" ? "nav-add" : ""}`} onClick={() => onSelect(label)}><i>{icon}</i><span>{language === "th" ? thai[label] : label}</span></button>)}</nav>;
 }

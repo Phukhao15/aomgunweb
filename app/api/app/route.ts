@@ -254,6 +254,26 @@ export async function POST(request: Request) {
       return Response.json({ childId, code, expiresAt }, { status: 201 });
     }
 
+    if (action === "regenerateChildInvite") {
+      const identity = await parentIdentity(request);
+      if (!identity) return error("Parent sign-in is required", 401);
+      const family = await parentFamily(identity);
+      if (!family) return error("Family was not found", 404);
+      const childId = String(payload.childId ?? "");
+      const child = await collections.children.doc(childId).get();
+      if (!child.exists || child.data()!.family_id !== family.id) return error("Child was not found in your family", 404);
+      const previousInvites = await collections.invites.where("child_id", "==", childId).get();
+      const code = randomCode();
+      const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+      const batch = getFirestoreDb().batch();
+      for (const invite of previousInvites.docs) {
+        if (!invite.data().used_at) batch.update(invite.ref, { used_at: now(), revoked: true });
+      }
+      batch.set(collections.invites.doc(id("inv")), { family_id: family.id, child_id: childId, code_hash: await sha256(code), expires_at: expiresAt, used_at: null, created_at: now() });
+      await batch.commit();
+      return Response.json({ childId, childName: child.data()!.name, code, expiresAt }, { status: 201 });
+    }
+
     if (action === "createParentInvite") {
       const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
