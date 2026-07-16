@@ -1,23 +1,59 @@
-import { ensureSchema, getD1, hashPin, id, randomCode, randomToken, sha256 } from "../../../db/runtime";
+import { adminAuth, firestore } from "../../../lib/firebase-admin";
 
-type ParentIdentity = { email: string; displayName: string };
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-function parentIdentity(request: Request): ParentIdentity | null {
-  const email = request.headers.get("oai-authenticated-user-email");
-  const encodedName = request.headers.get("oai-authenticated-user-full-name");
-  const encoding = request.headers.get("oai-authenticated-user-full-name-encoding");
-  if (email) {
-    let displayName = email;
-    if (encodedName && encoding === "percent-encoded-utf-8") {
-      try { displayName = decodeURIComponent(encodedName); } catch { /* fall back to email */ }
-    }
-    return { email: email.toLowerCase(), displayName };
-  }
-  const hostname = new URL(request.url).hostname;
-  if (hostname === "localhost" || hostname === "127.0.0.1") {
-    return { email: "parent@example.com", displayName: "Nina" };
-  }
-  return null;
+type Row = Record<string, unknown>;
+type ParentIdentity = { uid: string; email: string; displayName: string };
+
+const collections = {
+  users: firestore.collection("users"),
+  families: firestore.collection("families"),
+  members: firestore.collection("familyMembers"),
+  parentInvites: firestore.collection("parentInvites"),
+  children: firestore.collection("children"),
+  invites: firestore.collection("childInvites"),
+  childSessions: firestore.collection("childSessions"),
+  transactions: firestore.collection("transactions"),
+  goals: firestore.collection("savingsGoals"),
+};
+
+function now() {
+  return new Date().toISOString();
+}
+
+function id(prefix: string) {
+  return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function randomCode() {
+  const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  const value = Array.from(bytes, (byte) => letters[byte % letters.length]).join("");
+  return `${value.slice(0, 4)}-${value.slice(4)}`;
+}
+
+function base64Url(bytes: Uint8Array) {
+  return Buffer.from(bytes).toString("base64url");
+}
+
+function randomToken() {
+  return base64Url(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+async function sha256(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return base64Url(new Uint8Array(digest));
+}
+
+async function hashPin(pin: string, salt = randomToken().slice(0, 22)) {
+  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 120_000 }, material, 256);
+  return { salt, hash: base64Url(new Uint8Array(bits)) };
+}
+
+function row(idValue: string, data: FirebaseFirestore.DocumentData): Row {
+  return { id: idValue, ...data };
 }
 
 function cookieValue(request: Request, name: string) {
@@ -31,88 +67,114 @@ function cookieValue(request: Request, name: string) {
 
 function sessionCookie(token: string, request: Request) {
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return `nestmint_child_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`;
+  return `aomgun_child_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`;
 }
 
 function clearSessionCookie(request: Request) {
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return `nestmint_child_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`;
+  return `aomgun_child_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`;
 }
 
 function error(message: string, status = 400) {
   return Response.json({ error: message }, { status });
 }
 
-async function childFromSession(request: Request) {
-  const token = cookieValue(request, "nestmint_child_session");
-  if (!token) return null;
-  const tokenHash = await sha256(token);
-  return getD1().prepare(`
-    SELECT c.*, f.name AS family_name
-    FROM child_sessions s
-    JOIN children c ON c.id = s.child_id
-    JOIN families f ON f.id = c.family_id
-    WHERE s.token_hash = ? AND s.expires_at > CURRENT_TIMESTAMP
-  `).bind(tokenHash).first<Record<string, unknown>>();
+async function parentIdentity(request: Request): Promise<ParentIdentity | null> {
+  const authorization = request.headers.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  try {
+    const decoded = await adminAuth.verifyIdToken(authorization.slice(7));
+    if (!decoded.email) return null;
+    return {
+      uid: decoded.uid,
+      email: decoded.email.toLowerCase(),
+      displayName: String(decoded.name || decoded.email.split("@")[0]),
+    };
+  } catch {
+    return null;
+  }
 }
 
-async function parentFamily(identity: ParentIdentity) {
-  return getD1().prepare(`
-    SELECT f.id, f.name, f.owner_user_id AS owner_id, u.id AS member_user_id,
-      u.display_name, u.email, fm.role AS member_role
-    FROM users u
-    JOIN family_members fm ON fm.user_id = u.id
-    JOIN families f ON f.id = fm.family_id
-    WHERE u.email = ? ORDER BY CASE fm.role WHEN 'owner' THEN 0 ELSE 1 END LIMIT 1
-  `).bind(identity.email).first<Record<string, unknown>>();
+async function parentFamily(identity: ParentIdentity): Promise<Row | null> {
+  const membership = await collections.members.where("user_id", "==", identity.uid).limit(1).get();
+  if (membership.empty) return null;
+  const member = row(membership.docs[0].id, membership.docs[0].data());
+  const familyDoc = await collections.families.doc(String(member.family_id)).get();
+  if (!familyDoc.exists) return null;
+  const family = row(familyDoc.id, familyDoc.data()!);
+  return { ...family, member_user_id: identity.uid, member_role: member.role };
+}
+
+async function childFromSession(request: Request) {
+  const token = cookieValue(request, "aomgun_child_session");
+  if (!token) return null;
+  const tokenHash = await sha256(token);
+  const session = await collections.childSessions.doc(tokenHash).get();
+  if (!session.exists || new Date(String(session.data()!.expires_at)).getTime() <= Date.now()) return null;
+  const child = await collections.children.doc(String(session.data()!.child_id)).get();
+  return child.exists ? row(child.id, child.data()!) : null;
+}
+
+async function recordsBy(collection: FirebaseFirestore.CollectionReference, field: string, value: string) {
+  const snapshot = await collection.where(field, "==", value).get();
+  return snapshot.docs.map((doc) => row(doc.id, doc.data()));
+}
+
+function newestFirst(items: Row[]) {
+  return items.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 }
 
 async function childSnapshot(childId: string) {
-  const db = getD1();
-  const child = await db.prepare(`
-    SELECT c.id, c.family_id, c.name, c.age, c.avatar, c.nickname,
-      c.daily_budget, c.weekly_budget, c.monthly_budget, c.created_at,
-      f.name AS family_name,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE child_id = c.id), 0) AS balance
-    FROM children c JOIN families f ON f.id = c.family_id WHERE c.id = ?
-  `).bind(childId).first<Record<string, unknown>>();
-  const transactions = (await db.prepare("SELECT id, kind, amount, category, note, actor_type, created_at FROM transactions WHERE child_id = ? ORDER BY created_at DESC LIMIT 20").bind(childId).all()).results;
-  const goals = (await db.prepare("SELECT id, name, target_amount, saved_amount FROM savings_goals WHERE child_id = ? ORDER BY created_at DESC").bind(childId).all()).results;
-  return { child, transactions, goals };
+  const childDoc = await collections.children.doc(childId).get();
+  if (!childDoc.exists) throw new Error("Child not found");
+  const child = row(childDoc.id, childDoc.data()!);
+  const [familyDoc, transactions, goals] = await Promise.all([
+    collections.families.doc(String(child.family_id)).get(),
+    recordsBy(collections.transactions, "child_id", childId),
+    recordsBy(collections.goals, "child_id", childId),
+  ]);
+  const balance = transactions.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
+  return {
+    child: { ...child, family_name: familyDoc.data()?.name ?? "Family", balance },
+    transactions: newestFirst(transactions).slice(0, 20),
+    goals: newestFirst(goals),
+  };
 }
 
 async function parentSnapshot(identity: ParentIdentity) {
   const family = await parentFamily(identity);
   if (!family) return { role: "parent", registered: false, identity };
-  const db = getD1();
-  const members = (await db.prepare(`
-    SELECT u.id, u.display_name, u.email, fm.role, fm.created_at
-    FROM family_members fm JOIN users u ON u.id = fm.user_id
-    WHERE fm.family_id = ? ORDER BY CASE fm.role WHEN 'owner' THEN 0 ELSE 1 END, fm.created_at
-  `).bind(family.id).all()).results;
-  const children = (await db.prepare(`
-    SELECT c.id, c.name, c.age, c.avatar, c.nickname, c.daily_budget, c.weekly_budget, c.monthly_budget,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE child_id = c.id), 0) AS balance,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE child_id = c.id AND amount > 0), 0) AS received,
-      ABS(COALESCE((SELECT SUM(amount) FROM transactions WHERE child_id = c.id AND amount < 0), 0)) AS spent
-    FROM children c WHERE c.family_id = ? ORDER BY c.created_at
-  `).bind(family.id).all()).results;
-  const childIds = children.map((child) => String(child.id));
-  let transactions: Record<string, unknown>[] = [];
-  if (childIds.length) {
-    const placeholders = childIds.map(() => "?").join(",");
-    transactions = (await db.prepare(`SELECT t.id, t.child_id, c.name AS child_name, t.kind, t.amount, t.category, t.note, t.actor_type, t.created_at FROM transactions t JOIN children c ON c.id = t.child_id WHERE t.child_id IN (${placeholders}) ORDER BY t.created_at DESC LIMIT 30`).bind(...childIds).all()).results;
-  }
+  const [memberRows, childRows] = await Promise.all([
+    recordsBy(collections.members, "family_id", String(family.id)),
+    recordsBy(collections.children, "family_id", String(family.id)),
+  ]);
+  const members = await Promise.all(memberRows.map(async (member) => {
+    const user = await collections.users.doc(String(member.user_id)).get();
+    return { ...member, ...(user.data() ?? {}) };
+  }));
+  members.sort((a, b) => a.role === "owner" ? -1 : b.role === "owner" ? 1 : String(a.created_at).localeCompare(String(b.created_at)));
+  const transactionGroups = await Promise.all(childRows.map((child) => recordsBy(collections.transactions, "child_id", String(child.id))));
+  const children: Row[] = childRows.map((child, index) => {
+    const transactions = transactionGroups[index];
+    const balance = transactions.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
+    const received = transactions.filter((item) => Number(item.amount) > 0).reduce((sum, item) => sum + Number(item.amount), 0);
+    const spent = Math.abs(transactions.filter((item) => Number(item.amount) < 0).reduce((sum, item) => sum + Number(item.amount), 0));
+    return { ...child, balance, received, spent };
+  });
+  children.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  const transactions = newestFirst(transactionGroups.flat()).slice(0, 30).map((item) => ({
+    ...item,
+    child_name: children.find((child) => child.id === item.child_id)?.name ?? "Child",
+  }));
   return { role: "parent", registered: true, identity, family, members, children, transactions };
 }
 
 export async function GET(request: Request) {
   try {
-    await ensureSchema();
     const child = await childFromSession(request);
     if (child) return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) });
-    const identity = parentIdentity(request);
-    if (!identity) return Response.json({ role: "anonymous", signInPath: "/signin-with-chatgpt?return_to=%2F" });
+    const identity = await parentIdentity(request);
+    if (!identity) return Response.json({ role: "anonymous" });
     return Response.json(await parentSnapshot(identity));
   } catch (cause) {
     console.error(cause);
@@ -122,32 +184,29 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    await ensureSchema();
-    const payload = await request.json() as Record<string, unknown>;
+    const payload = await request.json() as Row;
     const action = String(payload.action ?? "");
-    const db = getD1();
 
     if (action === "registerParent") {
-      const identity = parentIdentity(request);
-      if (!identity) return error("Sign in is required", 401);
+      const identity = await parentIdentity(request);
+      if (!identity) return error("Parent sign-in is required", 401);
       const name = String(payload.name ?? identity.displayName).trim().slice(0, 60);
       const familyName = String(payload.familyName ?? "My Family").trim().slice(0, 80);
       if (!name || !familyName) return error("Name and family name are required");
-      const existing = await parentFamily(identity);
-      if (!existing) {
-        const userId = id("usr");
+      if (!await parentFamily(identity)) {
         const familyId = id("fam");
-        await db.batch([
-          db.prepare("INSERT INTO users (id, email, display_name) VALUES (?, ?, ?)").bind(userId, identity.email, name),
-          db.prepare("INSERT INTO families (id, owner_user_id, name) VALUES (?, ?, ?)").bind(familyId, userId, familyName),
-          db.prepare("INSERT INTO family_members (id, family_id, user_id, role) VALUES (?, ?, ?, 'owner')").bind(id("mbr"), familyId, userId),
-        ]);
+        const createdAt = now();
+        const batch = firestore.batch();
+        batch.set(collections.users.doc(identity.uid), { email: identity.email, display_name: name, created_at: createdAt });
+        batch.set(collections.families.doc(familyId), { owner_user_id: identity.uid, name: familyName, created_at: createdAt });
+        batch.set(collections.members.doc(`${familyId}_${identity.uid}`), { family_id: familyId, user_id: identity.uid, role: "owner", created_at: createdAt });
+        await batch.commit();
       }
       return Response.json(await parentSnapshot(identity), { status: 201 });
     }
 
     if (action === "addChild") {
-      const identity = parentIdentity(request);
+      const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
       const family = await parentFamily(identity);
       if (!family) return error("Create your family first", 409);
@@ -157,50 +216,48 @@ export async function POST(request: Request) {
       if (!name || !Number.isInteger(age) || age < 4 || age > 17) return error("Enter a valid child name and age");
       const childId = id("chd");
       const inviteId = id("inv");
+      const goalId = id("goal");
       const code = randomCode();
-      const codeHash = await sha256(code.toUpperCase());
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      await db.batch([
-        db.prepare("INSERT INTO children (id, family_id, name, age, avatar) VALUES (?, ?, ?, ?, ?)").bind(childId, family.id, name, age, avatar),
-        db.prepare("INSERT INTO invites (id, family_id, child_id, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)").bind(inviteId, family.id, childId, codeHash, expiresAt),
-        db.prepare("INSERT INTO savings_goals (id, child_id, name, target_amount, saved_amount) VALUES (?, ?, ?, ?, 0)").bind(id("goal"), childId, "New bicycle", 1200000),
-      ]);
+      const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+      const createdAt = now();
+      const batch = firestore.batch();
+      batch.set(collections.children.doc(childId), { family_id: family.id, name, age, avatar, nickname: null, pin_salt: null, pin_hash: null, daily_budget: 20000, weekly_budget: 100000, monthly_budget: 350000, created_at: createdAt });
+      batch.set(collections.invites.doc(inviteId), { family_id: family.id, child_id: childId, code_hash: await sha256(code), expires_at: expiresAt, used_at: null, created_at: createdAt });
+      batch.set(collections.goals.doc(goalId), { child_id: childId, name: "New bicycle", target_amount: 1200000, saved_amount: 0, created_at: createdAt });
+      await batch.commit();
       return Response.json({ childId, code, expiresAt }, { status: 201 });
     }
 
     if (action === "createParentInvite") {
-      const identity = parentIdentity(request);
+      const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
       const family = await parentFamily(identity);
       if (!family) return error("Family was not found", 404);
       const code = randomCode();
-      const codeHash = await sha256(code.toUpperCase());
       const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
-      await db.prepare("INSERT INTO parent_invites (id, family_id, invited_by_user_id, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(id("pinv"), family.id, family.member_user_id, codeHash, expiresAt).run();
+      await collections.parentInvites.doc(id("pinv")).set({ family_id: family.id, invited_by_user_id: identity.uid, code_hash: await sha256(code), expires_at: expiresAt, used_at: null, created_at: now() });
       return Response.json({ code, expiresAt, familyName: family.name }, { status: 201 });
     }
 
     if (action === "joinAsParent") {
-      const identity = parentIdentity(request);
+      const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
       const code = String(payload.code ?? "").trim().toUpperCase();
       if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code)) return error("Parent invite code is invalid");
       if (await parentFamily(identity)) return error("This account already belongs to a family", 409);
-      const invite = await db.prepare("SELECT id, family_id, invited_by_user_id, used_at, expires_at FROM parent_invites WHERE code_hash = ?")
-        .bind(await sha256(code)).first<Record<string, unknown>>();
-      if (!invite) return error("Parent invite was not found", 404);
-      if (invite.used_at) return error("This parent invite has already been used", 409);
-      if (new Date(String(invite.expires_at)).getTime() <= Date.now()) return error("This parent invite has expired", 410);
-      let user = await db.prepare("SELECT id FROM users WHERE email = ?").bind(identity.email).first<Record<string, unknown>>();
-      const userId = user ? String(user.id) : id("usr");
-      const statements = [];
-      if (!user) statements.push(db.prepare("INSERT INTO users (id, email, display_name) VALUES (?, ?, ?)").bind(userId, identity.email, identity.displayName));
-      statements.push(
-        db.prepare("INSERT INTO family_members (id, family_id, user_id, role, invited_by_user_id) VALUES (?, ?, ?, 'parent', ?)").bind(id("mbr"), invite.family_id, userId, invite.invited_by_user_id),
-        db.prepare("UPDATE parent_invites SET used_at = CURRENT_TIMESTAMP WHERE id = ?").bind(invite.id),
-      );
-      await db.batch(statements);
+      const inviteQuery = await collections.parentInvites.where("code_hash", "==", await sha256(code)).limit(1).get();
+      if (inviteQuery.empty) return error("Parent invite was not found", 404);
+      const inviteRef = inviteQuery.docs[0].ref;
+      await firestore.runTransaction(async (transaction) => {
+        const invite = await transaction.get(inviteRef);
+        const data = invite.data()!;
+        if (data.used_at) throw new Error("USED_PARENT_INVITE");
+        if (new Date(String(data.expires_at)).getTime() <= Date.now()) throw new Error("EXPIRED_PARENT_INVITE");
+        const memberRef = collections.members.doc(`${data.family_id}_${identity.uid}`);
+        transaction.set(collections.users.doc(identity.uid), { email: identity.email, display_name: identity.displayName, created_at: now() }, { merge: true });
+        transaction.set(memberRef, { family_id: data.family_id, user_id: identity.uid, role: "parent", invited_by_user_id: data.invited_by_user_id, created_at: now() });
+        transaction.update(inviteRef, { used_at: now() });
+      });
       return Response.json(await parentSnapshot(identity), { status: 201 });
     }
 
@@ -211,26 +268,30 @@ export async function POST(request: Request) {
       if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(code)) return error("Invite code is invalid");
       if (!nickname) return error("Nickname is required");
       if (!/^\d{4}$/.test(pin)) return error("PIN must contain exactly four digits");
-      const codeHash = await sha256(code);
-      const invite = await db.prepare(`SELECT i.id, i.child_id, i.used_at, i.expires_at FROM invites i WHERE i.code_hash = ?`).bind(codeHash).first<Record<string, unknown>>();
-      if (!invite) return error("Invite code was not found", 404);
-      if (invite.used_at) return error("This invite has already been used", 409);
-      if (new Date(String(invite.expires_at)).getTime() <= Date.now()) return error("This invite has expired", 410);
-      const { salt, hash } = await hashPin(pin);
+      const inviteQuery = await collections.invites.where("code_hash", "==", await sha256(code)).limit(1).get();
+      if (inviteQuery.empty) return error("Invite code was not found", 404);
+      const inviteRef = inviteQuery.docs[0].ref;
       const token = randomToken();
       const tokenHash = await sha256(token);
-      const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-      await db.batch([
-        db.prepare("UPDATE children SET nickname = ?, pin_salt = ?, pin_hash = ? WHERE id = ?").bind(nickname, salt, hash, invite.child_id),
-        db.prepare("UPDATE invites SET used_at = CURRENT_TIMESTAMP WHERE id = ?").bind(invite.id),
-        db.prepare("INSERT INTO child_sessions (token_hash, child_id, expires_at) VALUES (?, ?, ?)").bind(tokenHash, invite.child_id, sessionExpiry),
-      ]);
-      return Response.json({ role: "child", ...(await childSnapshot(String(invite.child_id))) }, { status: 201, headers: { "Set-Cookie": sessionCookie(token, request) } });
+      const sessionExpiry = new Date(Date.now() + 30 * 86_400_000).toISOString();
+      const pinData = await hashPin(pin);
+      let childId = "";
+      await firestore.runTransaction(async (transaction) => {
+        const invite = await transaction.get(inviteRef);
+        const data = invite.data()!;
+        if (data.used_at) throw new Error("USED_CHILD_INVITE");
+        if (new Date(String(data.expires_at)).getTime() <= Date.now()) throw new Error("EXPIRED_CHILD_INVITE");
+        childId = String(data.child_id);
+        transaction.update(collections.children.doc(childId), { nickname, pin_salt: pinData.salt, pin_hash: pinData.hash });
+        transaction.update(inviteRef, { used_at: now() });
+        transaction.set(collections.childSessions.doc(tokenHash), { child_id: childId, expires_at: sessionExpiry, created_at: now() });
+      });
+      return Response.json({ role: "child", ...(await childSnapshot(childId)) }, { status: 201, headers: { "Set-Cookie": sessionCookie(token, request) } });
     }
 
     if (action === "logoutChild") {
-      const token = cookieValue(request, "nestmint_child_session");
-      if (token) await db.prepare("DELETE FROM child_sessions WHERE token_hash = ?").bind(await sha256(token)).run();
+      const token = cookieValue(request, "aomgun_child_session");
+      if (token) await collections.childSessions.doc(await sha256(token)).delete();
       return Response.json({ ok: true }, { headers: { "Set-Cookie": clearSessionCookie(request) } });
     }
 
@@ -241,31 +302,32 @@ export async function POST(request: Request) {
       const category = String(payload.category ?? "Other").trim().slice(0, 30);
       const note = String(payload.note ?? "Expense").trim().slice(0, 80);
       if (!Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) return error("Enter a valid amount");
-      const balanceRow = await db.prepare("SELECT COALESCE(SUM(amount), 0) AS balance FROM transactions WHERE child_id = ?").bind(child.id).first<{ balance: number }>();
-      if (amount > Number(balanceRow?.balance ?? 0)) return error("This expense is higher than your available balance", 409);
-      await db.prepare("INSERT INTO transactions (id, child_id, actor_type, kind, amount, category, note) VALUES (?, ?, 'child', 'expense', ?, ?, ?)").bind(id("txn"), child.id, -amount, category, note).run();
+      const existing = await recordsBy(collections.transactions, "child_id", String(child.id));
+      const balance = existing.reduce((sum, item) => sum + Number(item.amount ?? 0), 0);
+      if (amount > balance) return error("This expense is higher than your available balance", 409);
+      await collections.transactions.doc(id("txn")).set({ child_id: child.id, actor_type: "child", kind: "expense", amount: -amount, category, note, created_at: now() });
       return Response.json({ role: "child", ...(await childSnapshot(String(child.id))) }, { status: 201 });
     }
 
     if (action === "sendAllowance" || action === "setBudgets") {
-      const identity = parentIdentity(request);
+      const identity = await parentIdentity(request);
       if (!identity) return error("Parent sign-in is required", 401);
       const family = await parentFamily(identity);
       if (!family) return error("Family was not found", 404);
       const childId = String(payload.childId ?? "");
-      const owned = await db.prepare("SELECT id FROM children WHERE id = ? AND family_id = ?").bind(childId, family.id).first();
-      if (!owned) return error("Child was not found in your family", 404);
+      const child = await collections.children.doc(childId).get();
+      if (!child.exists || child.data()!.family_id !== family.id) return error("Child was not found in your family", 404);
       if (action === "sendAllowance") {
         const amount = Math.round(Number(payload.amount) * 100);
         const note = String(payload.note ?? "Allowance").trim().slice(0, 80);
         if (!Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) return error("Enter a valid amount");
-        await db.prepare("INSERT INTO transactions (id, child_id, actor_type, kind, amount, category, note) VALUES (?, ?, 'parent', 'allowance', ?, 'Allowance', ?)").bind(id("txn"), childId, amount, note).run();
+        await collections.transactions.doc(id("txn")).set({ child_id: childId, actor_type: "parent", actor_user_id: identity.uid, kind: "allowance", amount, category: "Allowance", note, created_at: now() });
       } else {
         const daily = Math.round(Number(payload.daily) * 100);
         const weekly = Math.round(Number(payload.weekly) * 100);
         const monthly = Math.round(Number(payload.monthly) * 100);
         if (![daily, weekly, monthly].every((value) => Number.isFinite(value) && value >= 0 && value <= 100_000_000)) return error("Budget values are invalid");
-        await db.prepare("UPDATE children SET daily_budget = ?, weekly_budget = ?, monthly_budget = ? WHERE id = ? AND family_id = ?").bind(daily, weekly, monthly, childId, family.id).run();
+        await child.ref.update({ daily_budget: daily, weekly_budget: weekly, monthly_budget: monthly });
       }
       return Response.json(await parentSnapshot(identity));
     }
@@ -273,6 +335,9 @@ export async function POST(request: Request) {
     return error("Unknown action", 404);
   } catch (cause) {
     console.error(cause);
+    const message = cause instanceof Error ? cause.message : "";
+    if (message === "USED_PARENT_INVITE" || message === "USED_CHILD_INVITE") return error("This invite has already been used", 409);
+    if (message === "EXPIRED_PARENT_INVITE" || message === "EXPIRED_CHILD_INVITE") return error("This invite has expired", 410);
     return error("The request could not be completed", 500);
   }
 }

@@ -2,6 +2,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
+import {
+  createUserWithEmailAndPassword,
+  GoogleAuthProvider,
+  OAuthProvider,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+} from "firebase/auth";
+import { firebaseAuth } from "../lib/firebase-client";
 
 type Screen =
   | "welcome"
@@ -52,9 +61,9 @@ function Icon({ name }: { name: "arrow" | "bell" | "eye" | "plus" | "scan" | "co
 
 function Brand() {
   return (
-    <div className="brand" aria-label="NestMint">
+    <div className="brand" aria-label="AomGun">
       <span className="brand-mark"><span>●</span><span>●</span></span>
-      <span>NestMint</span>
+      <span>AomGun</span>
     </div>
   );
 }
@@ -84,6 +93,9 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [qrImage, setQrImage] = useState("");
   const [parentInviteCode, setParentInviteCode] = useState("");
+  const [parentEmail, setParentEmail] = useState("");
+  const [parentPassword, setParentPassword] = useState("");
+  const [authReady, setAuthReady] = useState(false);
 
   const parentChildren = data?.role === "parent" && data.registered ? data.children ?? [] : [];
   const activeChild = parentChildren.find((child: any) => child.id === activeChildId) ?? parentChildren[0] ?? null;
@@ -91,12 +103,15 @@ export default function Home() {
   const liveTransactions = data?.transactions ?? [];
 
   useEffect(() => {
-    void loadSession();
     const invite = new URLSearchParams(window.location.search).get("invite");
     if (invite) {
       setCode(invite.toUpperCase());
       setScreen("join");
     }
+    return onAuthStateChanged(firebaseAuth, () => {
+      setAuthReady(true);
+      void loadSession();
+    });
   }, []);
 
   useEffect(() => {
@@ -120,16 +135,23 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  async function authHeaders(): Promise<Record<string, string>> {
+    const token = await firebaseAuth.currentUser?.getIdToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
   async function loadSession() {
     try {
-      const response = await fetch("/api/app", { cache: "no-store" });
+      const response = await fetch("/api/app", { cache: "no-store", headers: await authHeaders() });
       const result = await response.json();
       setData(result);
       if (result.role === "child") {
         setNickname(result.child?.nickname ?? result.child?.name ?? "Milo");
       }
+      return result;
     } catch {
-      setToast("Could not connect to the local database");
+      setToast("Could not connect to AomGun");
+      return null;
     }
   }
 
@@ -138,7 +160,7 @@ export default function Home() {
     try {
       const response = await fetch("/api/app", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify({ action, ...payload }),
       });
       const result = await response.json();
@@ -158,14 +180,52 @@ export default function Home() {
       await runAction("logoutChild");
       await loadSession();
     }
-    const response = await fetch("/api/app", { cache: "no-store" });
-    const result = await response.json();
-    setData(result);
-    if (result.role === "anonymous" && result.signInPath) {
-      window.location.href = result.signInPath;
+    if (!firebaseAuth.currentUser) {
+      setRegisterStep(1);
+      navigate("register");
       return;
     }
+    const result = await loadSession();
+    if (!result) return;
     navigate(result.registered ? "parent" : "register");
+    if (!result.registered) setRegisterStep(2);
+  }
+
+  async function signInEmail() {
+    if (!parentEmail || parentPassword.length < 6) {
+      setToast("Enter your email and a password with at least 6 characters");
+      return;
+    }
+    setBusy(true);
+    try {
+      try {
+        await signInWithEmailAndPassword(firebaseAuth, parentEmail.trim(), parentPassword);
+      } catch {
+        await createUserWithEmailAndPassword(firebaseAuth, parentEmail.trim(), parentPassword);
+      }
+      const result = await loadSession();
+      if (result?.registered) navigate("parent");
+      else setRegisterStep(2);
+    } catch (cause: any) {
+      const code = String(cause?.code ?? "");
+      setToast(code.includes("email-already-in-use") ? "This email exists already. Check your password." : "Email sign-in could not be completed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signInProvider(provider: GoogleAuthProvider | OAuthProvider) {
+    setBusy(true);
+    try {
+      await signInWithPopup(firebaseAuth, provider);
+      const result = await loadSession();
+      if (result?.registered) navigate("parent");
+      else setRegisterStep(2);
+    } catch (cause: any) {
+      setToast(String(cause?.code ?? "").includes("popup-closed") ? "Sign-in window was closed" : "This sign-in method is not enabled yet");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function registerParent() {
@@ -192,6 +252,7 @@ export default function Home() {
   }
 
   async function joinAsParent() {
+    if (!firebaseAuth.currentUser) return setToast("Sign in first, then use your parent invite code");
     const invite = window.prompt("Enter the parent invite code");
     if (!invite) return;
     const result = await runAction("joinAsParent", { code: invite.toUpperCase() });
@@ -250,7 +311,7 @@ export default function Home() {
 
         {screen === "welcome" && (
           <div className="welcome-view">
-            <div className="welcome-top"><Brand /><button className="text-link" onClick={() => navigate("register")}>Sign in</button></div>
+            <div className="welcome-top"><Brand /><button className="text-link" onClick={() => navigate("register")}>{authReady ? "Sign in" : "Loading…"}</button></div>
             <div className="hero-art" aria-hidden="true">
               <div className="orbit orbit-one" /><div className="orbit orbit-two" />
               <div className="family-card parent-mini"><span>👩🏻</span><i>Parent</i></div>
@@ -281,11 +342,12 @@ export default function Home() {
             {registerStep === 1 && <>
               <div className="page-heading"><span className="kicker">FOR PARENTS</span><h2>Let’s create your<br />family space</h2><p>Start in seconds. Your family is created automatically.</p></div>
               <div className="auth-stack">
-                <button className="social-button" onClick={() => setToast("Add your Google Client ID to enable this provider")}><span className="google">G</span>Continue with Google</button>
-                <button className="social-button apple" onClick={() => setToast("Add your Apple Client ID to enable this provider")}><span>●</span>Continue with Apple</button>
+                <button className="social-button" disabled={busy} onClick={() => signInProvider(new GoogleAuthProvider())}><span className="google">G</span>Continue with Google</button>
+                <button className="social-button apple" disabled={busy} onClick={() => signInProvider(new OAuthProvider("apple.com"))}><span>●</span>Continue with Apple</button>
                 <div className="divider"><span>or use email</span></div>
-                <label>Email address<input type="email" defaultValue="parent@example.com" aria-label="Email address" /></label>
-                <button className="primary" onClick={() => setRegisterStep(2)}>Continue</button>
+                <label>Email address<input type="email" autoComplete="email" value={parentEmail} onChange={(event) => setParentEmail(event.target.value)} placeholder="parent@example.com" aria-label="Email address" /></label>
+                <label>Password<input type="password" autoComplete="current-password" value={parentPassword} onChange={(event) => setParentPassword(event.target.value)} placeholder="At least 6 characters" aria-label="Password" /></label>
+                <button className="primary" disabled={busy} onClick={signInEmail}>{busy ? "Signing in…" : "Continue"}</button>
                 <button className="secondary-link" onClick={joinAsParent}>I have a parent invite code</button>
               </div>
             </>}
