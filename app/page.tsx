@@ -144,13 +144,14 @@ export default function Home() {
     try {
       const response = await fetch("/api/app", { cache: "no-store", headers: await authHeaders() });
       const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "Could not load your account");
       setData(result);
       if (result.role === "child") {
         setNickname(result.child?.nickname ?? result.child?.name ?? "Milo");
       }
       return result;
-    } catch {
-      setToast("Could not connect to AomGun Family");
+    } catch (cause) {
+      setToast(cause instanceof Error ? cause.message : "Could not connect to AomGun Family");
       return null;
     }
   }
@@ -187,6 +188,12 @@ export default function Home() {
     }
     const result = await loadSession();
     if (!result) return;
+    if (result.role !== "parent") {
+      setRegisterStep(1);
+      navigate("register");
+      setToast("Please sign in as a parent first");
+      return;
+    }
     navigate(result.registered ? "parent" : "register");
     if (!result.registered) setRegisterStep(2);
   }
@@ -204,7 +211,9 @@ export default function Home() {
         await createUserWithEmailAndPassword(firebaseAuth, parentEmail.trim(), parentPassword);
       }
       const result = await loadSession();
-      if (result?.registered) navigate("parent");
+      if (!result) return;
+      if (result.role !== "parent") throw new Error("Parent sign-in could not be verified");
+      if (result.registered) navigate("parent");
       else setRegisterStep(2);
     } catch (cause: any) {
       const code = String(cause?.code ?? "");
@@ -219,7 +228,9 @@ export default function Home() {
     try {
       await signInWithPopup(firebaseAuth, provider);
       const result = await loadSession();
-      if (result?.registered) navigate("parent");
+      if (!result) return;
+      if (result.role !== "parent") throw new Error("Parent sign-in could not be verified");
+      if (result.registered) navigate("parent");
       else setRegisterStep(2);
     } catch (cause: any) {
       setToast(String(cause?.code ?? "").includes("popup-closed") ? "Sign-in window was closed" : "This sign-in method is not enabled yet");

@@ -99,8 +99,9 @@ async function parentIdentity(request: Request): Promise<ParentIdentity | null> 
       email: decoded.email.toLowerCase(),
       displayName: String(decoded.name || decoded.email.split("@")[0]),
     };
-  } catch {
-    return null;
+  } catch (cause) {
+    console.error("Parent token verification failed", cause);
+    throw new Error("PARENT_AUTH_FAILED");
   }
 }
 
@@ -187,6 +188,9 @@ export async function GET(request: Request) {
     return Response.json(await parentSnapshot(identity));
   } catch (cause) {
     console.error(cause);
+    if (cause instanceof Error && cause.message === "PARENT_AUTH_FAILED") {
+      return error("Parent sign-in could not be verified. Check the Firebase Admin environment variable and redeploy.", 503);
+    }
     return error("Unable to load your family right now", 500);
   }
 }
@@ -345,6 +349,7 @@ export async function POST(request: Request) {
   } catch (cause) {
     console.error(cause);
     const message = cause instanceof Error ? cause.message : "";
+    if (message === "PARENT_AUTH_FAILED") return error("Parent sign-in could not be verified. Check the Firebase Admin environment variable and redeploy.", 503);
     if (message === "USED_PARENT_INVITE" || message === "USED_CHILD_INVITE") return error("This invite has already been used", 409);
     if (message === "EXPIRED_PARENT_INVITE" || message === "EXPIRED_CHILD_INVITE") return error("This invite has expired", 410);
     return error("The request could not be completed", 500);
